@@ -565,3 +565,59 @@ def sparse_attn_varlen_func(
         None,
     )
     return (out, softmax_lse) if return_softmax_lse else out
+
+
+def epd_fused_fwd_kvcache(
+    q_a,            # [batch_a, seqlen_q_a, num_heads, head_size]
+    kcache_a,       # paged: [num_blocks, page_size, num_kv_heads, head_size]
+    vcache_a,
+    seqlens_k_a,    # [batch_a] int32, actual KV lengths for phase_a
+    q_b,            # [batch_b, seqlen_q_b, num_heads, head_size]
+    kcache_b,
+    vcache_b,
+    seqlens_k_b,    # [batch_b] int32
+    k_new=None,     # [batch_b, 1, num_kv_heads, head_size] new K for decode append
+    v_new=None,     # [batch_b, 1, num_kv_heads, head_size] new V for decode append
+    block_table_a=None,
+    block_table_b=None,
+    cache_batch_idx=None,
+    softmax_scale=None,
+    is_causal_a=True,
+    is_causal_b=False,
+    window_size_left=-1,
+    window_size_right=-1,
+    num_splits_a=0,
+    num_splits_b=0,
+):
+    """
+    EPD fused 2-phase attention with paged KV cache.
+
+    Fuses two attention phases (e.g., prefill+decode or encode+decode) into
+    a single kernel launch with SM-aware threadblock scheduling.
+    """
+    if softmax_scale is None:
+        softmax_scale = q_a.shape[-1] ** (-0.5)
+
+    out_a, out_b = torch.ops._vllm_fa2_C.epd_fwd_kvcache(
+        q_a,
+        kcache_a,
+        vcache_a,
+        seqlens_k_a,
+        q_b,
+        kcache_b,
+        vcache_b,
+        seqlens_k_b,
+        k_new,
+        v_new,
+        block_table_a,
+        block_table_b,
+        cache_batch_idx,
+        softmax_scale,
+        is_causal_a,
+        is_causal_b,
+        window_size_left,
+        window_size_right,
+        num_splits_a,
+        num_splits_b,
+    )
+    return out_a, out_b

@@ -8,6 +8,7 @@ from vllm.vllm_flash_attn.flash_attn_interface import (
     flash_attn_varlen_func,
     get_scheduler_metadata,
     is_fa_version_supported,
+    epd_fused_fwd_kvcache,
 )
 
 if not (FA2_AVAILABLE or FA3_AVAILABLE):
@@ -21,4 +22,5 @@ __all__ = [
     "flash_attn_varlen_func",
     "get_scheduler_metadata",
     "is_fa_version_supported",
+    "epd_fused_fwd_kvcache",
 ]
