@@ -581,6 +581,8 @@ def epd_fused_fwd_kvcache(
     block_table_a=None,
     block_table_b=None,
     cache_batch_idx=None,
+    out_a=None,     # pre-allocated output for phase_a (avoids allocation overhead)
+    out_b=None,     # pre-allocated output for phase_b
     softmax_scale=None,
     is_causal_a=True,
     is_causal_b=False,
@@ -612,6 +614,8 @@ def epd_fused_fwd_kvcache(
         block_table_a,
         block_table_b,
         cache_batch_idx,
+        out_a,
+        out_b,
         softmax_scale,
         is_causal_a,
         is_causal_b,
