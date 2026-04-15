@@ -203,6 +203,10 @@ class Scheduler(SchedulerInterface):
         self.max_num_encoder_input_tokens = (
             mm_budget.encoder_compute_budget if mm_budget else 0
         )
+        # Requests whose encoder is running on the parallel stream.
+        # These get encoder inputs scheduled but 0 prefill tokens until
+        # the encoder finishes (checked via CUDA event next iteration).
+        self.encoding_in_progress: set[str] = set()
         encoder_cache_size = mm_budget.encoder_cache_size if mm_budget else 0
         self.encoder_cache_manager = (
             EncoderDecoderCacheManager(cache_size=encoder_cache_size)
@@ -361,6 +365,11 @@ class Scheduler(SchedulerInterface):
         scheduled_resumed_reqs: list[Request] = []
         scheduled_running_reqs: list[Request] = []
         preempted_reqs: list[Request] = []
+
+        # Parallel encoder stream: requests that were encoding last iteration
+        # are now ready for prefill (one-iteration delay assumption).
+        prev_encoding = self.encoding_in_progress
+        self.encoding_in_progress = set()
 
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
@@ -694,7 +703,38 @@ class Scheduler(SchedulerInterface):
                             encoder_compute_budget,
                             shift_computed_tokens=1 if self.use_eagle else 0,
                         )
-                        if num_new_tokens == 0:
+                        # Parallel encoder stream: if we have encoder inputs
+                        # to schedule, run them on stream 2 this iteration
+                        # but defer prefill to the next iteration.
+                        if (encoder_inputs_to_schedule
+                                and num_computed_tokens == 0):
+                            self.encoding_in_progress.add(request_id)
+                            # Skip KV alloc and prefill — jump straight to
+                            # admitting the request with 0 decode tokens.
+                            request = request_queue.pop_request()
+                            self.running.append(request)
+                            if self.log_stats:
+                                request.record_event(
+                                    EngineCoreEventType.SCHEDULED,
+                                    scheduled_timestamp,
+                                )
+                            scheduled_new_reqs.append(request)
+                            req_to_new_blocks[request_id] = (
+                                self.kv_cache_manager.get_blocks(request_id)
+                            )
+                            num_scheduled_tokens[request_id] = 0
+                            request.status = RequestStatus.RUNNING
+                            request.num_computed_tokens = 0
+                            if request.num_cached_tokens < 0:
+                                request.num_cached_tokens = 0
+                            scheduled_encoder_inputs[request_id] = (
+                                encoder_inputs_to_schedule
+                            )
+                            for i in encoder_inputs_to_schedule:
+                                self.encoder_cache_manager.allocate(request, i)
+                            encoder_compute_budget = new_encoder_compute_budget
+                            continue
+                        elif num_new_tokens == 0:
                             # The request cannot be scheduled.
                             break
 

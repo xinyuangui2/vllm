@@ -506,6 +506,15 @@ class GPUModelRunner(
         # Encoder CUDA graph manager (initialized after model load if enabled)
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
+        # Parallel encoder stream: runs vision encoder concurrently with
+        # LLM forward (decode is memory-bound, encoder is compute-bound,
+        # so GPU hardware interleaves them naturally).
+        self.encoder_stream: torch.cuda.Stream | None = None
+        self.encoder_done_event: torch.cuda.Event | None = None
+        if self.supports_mm_inputs:
+            self.encoder_stream = torch.cuda.Stream()
+            self.encoder_done_event = torch.cuda.Event()
+
         self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
@@ -3209,12 +3218,20 @@ class GPUModelRunner(
         ec_connector_output = None
 
         if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
-            # Run the multimodal encoder if any.
+            # Wait for the parallel encoder stream from the previous
+            # iteration to finish before reading encoder_cache.
+            if self.encoder_done_event is not None:
+                torch.cuda.current_stream().wait_event(
+                    self.encoder_done_event)
+
+            # Gather embeddings from encoder_cache (populated by the
+            # previous iteration's encoder run on stream 2).
+            # NOTE: _execute_mm_encoder() is no longer called here —
+            # it runs in parallel with _model_forward() in execute_model().
             with self.maybe_get_ec_connector_output(
                 scheduler_output,
                 encoder_cache=self.encoder_cache,
             ) as ec_connector_output:
-                self._execute_mm_encoder(scheduler_output)
                 mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
@@ -3996,6 +4013,17 @@ class GPUModelRunner(
         has_encoder_input = (
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
+
+        # Launch encoder on parallel stream 2 (compute-bound) so it
+        # overlaps with LLM forward on stream 1 (memory-bound decode).
+        # Encoder outputs go to self.encoder_cache and are consumed by
+        # _gather_mm_embeddings() in the NEXT iteration's _preprocess().
+        if (self.encoder_stream is not None
+                and scheduler_output.scheduled_encoder_inputs
+                and not self.model_config.is_encoder_decoder):
+            with torch.cuda.stream(self.encoder_stream):
+                self._execute_mm_encoder(scheduler_output)
+            self.encoder_done_event.record(self.encoder_stream)
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
