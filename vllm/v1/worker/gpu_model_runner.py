@@ -3218,16 +3218,11 @@ class GPUModelRunner(
         ec_connector_output = None
 
         if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
-            # Wait for the parallel encoder stream from the previous
-            # iteration to finish before reading encoder_cache.
-            if self.encoder_done_event is not None:
-                torch.cuda.current_stream().wait_event(
-                    self.encoder_done_event)
-
-            # Gather embeddings from encoder_cache (populated by the
-            # previous iteration's encoder run on stream 2).
-            # NOTE: _execute_mm_encoder() is no longer called here —
-            # it runs in parallel with _model_forward() in execute_model().
+            # Gather embeddings from encoder_cache.  Encoder outputs are
+            # populated by a PREVIOUS iteration's stream-2 encoder run
+            # (waited on at end of that iteration's execute_model).
+            # _execute_mm_encoder() is NOT called here — it runs on
+            # stream 2 in execute_model(), overlapping with _model_forward().
             with self.maybe_get_ec_connector_output(
                 scheduler_output,
                 encoder_cache=self.encoder_cache,
@@ -3830,6 +3825,17 @@ class GPUModelRunner(
                     return make_empty_encoder_model_runner_output(scheduler_output)
 
             if not num_scheduled_tokens:
+                # Encoder-only iteration: run encoder on stream 2
+                # even though there are no LLM tokens to forward.
+                if (self.encoder_stream is not None
+                        and scheduler_output.scheduled_encoder_inputs
+                        and not self.model_config.is_encoder_decoder):
+                    with torch.cuda.stream(self.encoder_stream):
+                        self._execute_mm_encoder(scheduler_output)
+                    self.encoder_done_event.record(self.encoder_stream)
+                    torch.cuda.current_stream().wait_event(
+                        self.encoder_done_event)
+
                 if (
                     self.parallel_config.distributed_executor_backend
                     == "external_launcher"
@@ -4128,6 +4134,11 @@ class GPUModelRunner(
             slot_mappings,
         )
         self.kv_connector_output = kv_connector_output
+
+        # Wait for encoder stream 2 to finish so encoder_cache is
+        # populated before the next iteration's _preprocess gathers.
+        if self.encoder_done_event is not None:
+            torch.cuda.current_stream().wait_event(self.encoder_done_event)
 
         # Now the batch has been launched we can wait for corrections from the
         # previous model forward without breaking async scheduling.

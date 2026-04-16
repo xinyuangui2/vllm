@@ -442,6 +442,24 @@ class Scheduler(SchedulerInterface):
                     encoder_compute_budget,
                     shift_computed_tokens=1 if self.use_eagle else 0,
                 )
+                # Parallel encoder stream: if the RUNNING request needs
+                # new encoder work, schedule encode-only (0 prefill tokens)
+                # so the encoder runs on stream 2 this iteration and
+                # prefill happens next iteration.
+                if encoder_inputs_to_schedule:
+                    self.encoding_in_progress.add(request.request_id)
+                    # Schedule encode-only: encoder runs on stream 2,
+                    # no prefill tokens.  Request is NOT in
+                    # num_scheduled_tokens — model runner will remove it
+                    # from input_batch (but keep self.requests[req_id]).
+                    # It re-enters via scheduled_cached_reqs next iteration.
+                    scheduled_encoder_inputs[request.request_id] = (
+                        encoder_inputs_to_schedule)
+                    for i in encoder_inputs_to_schedule:
+                        self.encoder_cache_manager.allocate(request, i)
+                    encoder_compute_budget = new_encoder_compute_budget
+                    req_index += 1
+                    continue
 
             if self.need_mamba_block_aligned_split:
                 num_new_tokens = self._mamba_block_aligned_split(
@@ -703,14 +721,13 @@ class Scheduler(SchedulerInterface):
                             encoder_compute_budget,
                             shift_computed_tokens=1 if self.use_eagle else 0,
                         )
-                        # Parallel encoder stream: if we have encoder inputs
-                        # to schedule, run them on stream 2 this iteration
-                        # but defer prefill to the next iteration.
-                        if (encoder_inputs_to_schedule
-                                and num_computed_tokens == 0):
+                        # Parallel encoder stream: schedule encoder on
+                        # stream 2 this iteration, defer prefill to next.
+                        # Request goes into scheduled_new_reqs (so model
+                        # runner sets up request state for _execute_mm_encoder)
+                        # but with 0 scheduled tokens (no LLM forward).
+                        if encoder_inputs_to_schedule:
                             self.encoding_in_progress.add(request_id)
-                            # Skip KV alloc and prefill — jump straight to
-                            # admitting the request with 0 decode tokens.
                             request = request_queue.pop_request()
                             self.running.append(request)
                             if self.log_stats:
@@ -724,9 +741,10 @@ class Scheduler(SchedulerInterface):
                             )
                             num_scheduled_tokens[request_id] = 0
                             request.status = RequestStatus.RUNNING
-                            request.num_computed_tokens = 0
+                            request.num_computed_tokens = num_computed_tokens
                             if request.num_cached_tokens < 0:
-                                request.num_cached_tokens = 0
+                                request.num_cached_tokens = (
+                                    num_computed_tokens)
                             scheduled_encoder_inputs[request_id] = (
                                 encoder_inputs_to_schedule
                             )
@@ -734,7 +752,7 @@ class Scheduler(SchedulerInterface):
                                 self.encoder_cache_manager.allocate(request, i)
                             encoder_compute_budget = new_encoder_compute_budget
                             continue
-                        elif num_new_tokens == 0:
+                        if num_new_tokens == 0:
                             # The request cannot be scheduled.
                             break
 
@@ -1383,6 +1401,10 @@ class Scheduler(SchedulerInterface):
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+            if num_tokens_scheduled == 0:
+                # Encoding-in-progress: encoder ran on stream 2,
+                # no LLM tokens this iteration. Skip.
+                continue
             assert num_tokens_scheduled > 0
             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
                 # skip failed or rescheduled requests from KV load failure
