@@ -207,6 +207,8 @@ class Scheduler(SchedulerInterface):
         # These get encoder inputs scheduled but 0 prefill tokens until
         # the encoder finishes (checked via CUDA event next iteration).
         self.encoding_in_progress: set[str] = set()
+        self._parallel_encoder_enabled = (
+            not envs.VLLM_DISABLE_PARALLEL_ENCODER)
         encoder_cache_size = mm_budget.encoder_cache_size if mm_budget else 0
         self.encoder_cache_manager = (
             EncoderDecoderCacheManager(cache_size=encoder_cache_size)
@@ -446,7 +448,7 @@ class Scheduler(SchedulerInterface):
                 # new encoder work, schedule encode-only (0 prefill tokens)
                 # so the encoder runs on stream 2 this iteration and
                 # prefill happens next iteration.
-                if encoder_inputs_to_schedule:
+                if encoder_inputs_to_schedule and self._parallel_encoder_enabled:
                     self.encoding_in_progress.add(request.request_id)
                     # Schedule encode-only: encoder runs on stream 2,
                     # no prefill tokens.  Request is NOT in
@@ -726,7 +728,7 @@ class Scheduler(SchedulerInterface):
                         # Request goes into scheduled_new_reqs (so model
                         # runner sets up request state for _execute_mm_encoder)
                         # but with 0 scheduled tokens (no LLM forward).
-                        if encoder_inputs_to_schedule:
+                        if encoder_inputs_to_schedule and self._parallel_encoder_enabled:
                             self.encoding_in_progress.add(request_id)
                             request = request_queue.pop_request()
                             self.running.append(request)

@@ -511,7 +511,7 @@ class GPUModelRunner(
         # so GPU hardware interleaves them naturally).
         self.encoder_stream: torch.cuda.Stream | None = None
         self.encoder_done_event: torch.cuda.Event | None = None
-        if self.supports_mm_inputs:
+        if self.supports_mm_inputs and not envs.VLLM_DISABLE_PARALLEL_ENCODER:
             self.encoder_stream = torch.cuda.Stream()
             self.encoder_done_event = torch.cuda.Event()
 
@@ -1183,10 +1183,18 @@ class GPUModelRunner(
             if self.uses_xdrope_dim > 0:
                 self._init_xdrope_positions(req_state)
 
-            reqs_to_add.append(req_state)
-            # Track new requests for ngram_gpu full tensor copy
-            if is_ngram_gpu:
-                ngram_gpu_new_reqs.append(req_state)
+            # Skip adding encoding-in-progress requests (0 scheduled
+            # tokens) to input_batch.  They are tracked in self.requests
+            # so the encoder can reference them.  Next iteration, the
+            # scheduler sends them as cached reqs; the model runner
+            # sees req_index=None and re-adds them via reqs_to_add.
+            num_sched = scheduler_output.num_scheduled_tokens.get(
+                req_id, 1)
+            if num_sched > 0:
+                reqs_to_add.append(req_state)
+                # Track new requests for ngram_gpu full tensor copy
+                if is_ngram_gpu:
+                    ngram_gpu_new_reqs.append(req_state)
 
         # Update the states of the running/resumed requests.
         is_last_rank = get_pp_group().is_last_rank
@@ -3227,6 +3235,9 @@ class GPUModelRunner(
                 scheduler_output,
                 encoder_cache=self.encoder_cache,
             ) as ec_connector_output:
+                if self.encoder_stream is None:
+                    # Baseline mode: run encoder inline (blocking).
+                    self._execute_mm_encoder(scheduler_output)
                 mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
 
             # NOTE(woosuk): To unify token ids and soft tokens (vision
