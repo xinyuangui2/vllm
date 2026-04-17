@@ -242,6 +242,7 @@ if TYPE_CHECKING:
     VLLM_DEBUG_WORKSPACE: bool = False
     VLLM_DISABLE_SHARED_EXPERTS_STREAM: bool = False
     VLLM_DISABLE_PARALLEL_ENCODER: bool = False
+    VLLM_PROFILE_ENCODER_OVERLAP: bool = False
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool = False
@@ -1635,6 +1636,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of overlapping with LLM decode on a separate CUDA stream.
     "VLLM_DISABLE_PARALLEL_ENCODER": lambda: bool(
         int(os.getenv("VLLM_DISABLE_PARALLEL_ENCODER", "0"))
+    ),
+    # When set, records CUDA events around encoder and LLM forward to
+    # measure kernel overlap between the two streams.  Results are written
+    # to VLLM_PROFILE_ENCODER_OVERLAP (path) or stderr if set to "1".
+    "VLLM_PROFILE_ENCODER_OVERLAP": lambda: bool(
+        int(os.getenv("VLLM_PROFILE_ENCODER_OVERLAP", "0"))
     ),
     # Limits when we run shared_experts in a separate stream.
     # We found out that for large batch sizes, the separate stream

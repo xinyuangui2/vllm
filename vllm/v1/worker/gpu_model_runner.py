@@ -515,6 +515,15 @@ class GPUModelRunner(
             self.encoder_stream = torch.cuda.Stream()
             self.encoder_done_event = torch.cuda.Event()
 
+        # Overlap profiling: measure encoder vs forward kernel overlap
+        self._profile_overlap = envs.VLLM_PROFILE_ENCODER_OVERLAP
+        self._overlap_records: list[dict] = []
+        if self._profile_overlap:
+            self._enc_start_event = torch.cuda.Event(enable_timing=True)
+            self._enc_end_event = torch.cuda.Event(enable_timing=True)
+            self._fwd_start_event = torch.cuda.Event(enable_timing=True)
+            self._fwd_end_event = torch.cuda.Event(enable_timing=True)
+
         self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
@@ -4031,22 +4040,19 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
-        # Launch encoder on parallel stream 2 (compute-bound) so it
-        # overlaps with LLM forward on stream 1 (memory-bound decode).
-        # Encoder outputs go to self.encoder_cache and are consumed by
-        # _gather_mm_embeddings() in the NEXT iteration's _preprocess().
-        if (self.encoder_stream is not None
-                and scheduler_output.scheduled_encoder_inputs
-                and not self.model_config.is_encoder_decoder):
-            with torch.cuda.stream(self.encoder_stream):
-                self._execute_mm_encoder(scheduler_output)
-            self.encoder_done_event.record(self.encoder_stream)
-
-        # Run the model.
-        # Use persistent buffers for CUDA graphs.
-        # When spec decode is enabled, defer connector finalization
-        # (wait_for_save + clear metadata) until after draft model runs.
+        # Run the model FIRST — launch forward on the default stream so
+        # GPU work starts immediately, BEFORE the encoder CPU prep.
+        # The forward does NOT depend on this iteration's encoder output
+        # (encoder populates encoder_cache for the NEXT iteration).
+        _profiling_encoder = False
+        _cpu_enc_start = 0.0
+        _cpu_enc_end = 0.0
+        _cpu_fwd_start = 0.0
         defer_kv_connector_finalize = self.speculative_config is not None
+        if self._profile_overlap:
+            import time as _time
+            _cpu_fwd_start = _time.perf_counter()
+            self._fwd_start_event.record()
         with (
             set_forward_context(
                 attn_metadata,
@@ -4072,6 +4078,26 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        if self._profile_overlap:
+            self._fwd_end_event.record()
+
+        # NOW launch encoder on stream 2 — the CPU prep (26ms) happens
+        # while the forward kernels are already running on the GPU.
+        # Encoder outputs go to self.encoder_cache and are consumed by
+        # _gather_mm_embeddings() in the NEXT iteration's _preprocess().
+        if (self.encoder_stream is not None
+                and scheduler_output.scheduled_encoder_inputs
+                and not self.model_config.is_encoder_decoder):
+            if self._profile_overlap:
+                _cpu_enc_start = _time.perf_counter()
+                self._enc_start_event.record(self.encoder_stream)
+            with torch.cuda.stream(self.encoder_stream):
+                self._execute_mm_encoder(scheduler_output)
+            if self._profile_overlap:
+                _cpu_enc_end = _time.perf_counter()
+                self._enc_end_event.record(self.encoder_stream)
+                _profiling_encoder = True
+            self.encoder_done_event.record(self.encoder_stream)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4150,6 +4176,52 @@ class GPUModelRunner(
         # populated before the next iteration's _preprocess gathers.
         if self.encoder_done_event is not None:
             torch.cuda.current_stream().wait_event(self.encoder_done_event)
+
+        # Record overlap profiling data
+        if self._profile_overlap:
+            torch.cuda.synchronize()
+            fwd_ms = self._fwd_start_event.elapsed_time(self._fwd_end_event)
+            if _profiling_encoder:
+                enc_ms = self._enc_start_event.elapsed_time(
+                    self._enc_end_event)
+                enc_start_to_fwd_start = (
+                    self._enc_start_event.elapsed_time(self._fwd_start_event))
+                enc_start_to_fwd_end = (
+                    self._enc_start_event.elapsed_time(self._fwd_end_event))
+                overlap_ms = max(0.0,
+                    min(enc_ms, enc_start_to_fwd_end)
+                    - max(0.0, enc_start_to_fwd_start))
+                cpu_enc_ms = (_cpu_enc_end - _cpu_enc_start) * 1000
+                cpu_gap_ms = (
+                    (_cpu_fwd_start - _cpu_enc_end) * 1000
+                    if _cpu_enc_end > 0 else 0)
+                record = {
+                    "type": "overlap",
+                    "iter": len(self._overlap_records),
+                    "encoder_ms": round(enc_ms, 3),
+                    "forward_ms": round(fwd_ms, 3),
+                    "overlap_ms": round(overlap_ms, 3),
+                    "enc_start_to_fwd_start_ms": round(
+                        enc_start_to_fwd_start, 3),
+                    "cpu_enc_ms": round(cpu_enc_ms, 3),
+                    "cpu_gap_to_fwd_ms": round(cpu_gap_ms, 3),
+                    "num_encoder_inputs": len(
+                        scheduler_output.scheduled_encoder_inputs),
+                    "num_reqs": self.input_batch.num_reqs,
+                    "total_tokens": scheduler_output.total_num_scheduled_tokens,
+                    "max_tokens_per_req": max_num_scheduled_tokens,
+                }
+            else:
+                record = {
+                    "type": "forward_only",
+                    "iter": len(self._overlap_records),
+                    "forward_ms": round(fwd_ms, 3),
+                    "num_reqs": self.input_batch.num_reqs,
+                    "total_tokens": scheduler_output.total_num_scheduled_tokens,
+                    "max_tokens_per_req": max_num_scheduled_tokens,
+                }
+            self._overlap_records.append(record)
+            logger.info("OVERLAP_PROFILE: %s", record)
 
         # Now the batch has been launched we can wait for corrections from the
         # previous model forward without breaking async scheduling.
