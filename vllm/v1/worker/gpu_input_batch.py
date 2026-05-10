@@ -235,6 +235,11 @@ class InputBatch:
 
         self.num_logprobs: dict[str, int] = {}
 
+        # paper_explore SYS1: requests that asked for hidden-state extraction
+        # via SamplingParams.extract_hidden_states=True. Only meaningful when
+        # the worker has VLLM_EXTRACT_HIDDEN_STATES_LAYER set.
+        self.extract_hidden_states_reqs: set[str] = set()
+
         # To accumulate prompt logprobs tensor chunks across prefill steps.
         self.in_progress_prompt_logprobs_cpu: dict[str, LogprobsTensors] = {}
 
@@ -395,6 +400,9 @@ class InputBatch:
                     else sampling_params.logprobs
                 )
 
+            if sampling_params.extract_hidden_states:
+                self.extract_hidden_states_reqs.add(req_id)
+
             if sampling_params.allowed_token_ids:
                 self.has_allowed_token_ids.add(req_id)
                 if self.allowed_token_ids_mask_cpu_tensor is None:
@@ -522,6 +530,7 @@ class InputBatch:
         self.repetition_penalties_reqs.discard(req_id)
         self.generators.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
+        self.extract_hidden_states_reqs.discard(req_id)
         self.in_progress_prompt_logprobs_cpu.pop(req_id, None)
         if self.prev_req_id_to_index is not None:
             self.prev_req_id_to_index.pop(req_id, None)
