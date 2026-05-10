@@ -250,6 +250,13 @@ class SamplingParams(
     include_stop_str_in_output: bool = False
     """Whether to include the stop strings in output text."""
     output_kind: RequestOutputKind = RequestOutputKind.CUMULATIVE
+    extract_hidden_states: bool = False
+    """When True, capture the last-token hidden state at the layer
+    configured by `VLLM_EXTRACT_HIDDEN_STATES_LAYER` (an N-from-end
+    decoder layer index) for every step of this request and surface
+    it on `RequestOutput.hidden_states`. Used by the paper_explore
+    head-cascade for in-flight cut-0.0 / cut-1.0 scoring. Has no
+    effect when `VLLM_EXTRACT_HIDDEN_STATES_LAYER` is unset."""
     skip_clone: bool = False
     """Internal flag indicating that this SamplingParams instance is safe to
     reuse without cloning. When True, clone() will return self without

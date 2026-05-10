@@ -121,6 +121,7 @@ class RequestOutput:
         num_cached_tokens: int | None = None,
         *,
         kv_transfer_params: dict[str, Any] | None = None,
+        hidden_states: torch.Tensor | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -141,12 +142,21 @@ class RequestOutput:
         self.encoder_prompt_token_ids = encoder_prompt_token_ids
         self.num_cached_tokens = num_cached_tokens
         self.kv_transfer_params = kv_transfer_params
+        # paper_explore SYS1: last-token hidden state at the configured
+        # extract layer for the most recent step. None when the request
+        # didn't ask for it (SamplingParams.extract_hidden_states=False)
+        # or the worker isn't configured (VLLM_EXTRACT_HIDDEN_STATES_LAYER
+        # unset). Updated per-step in streaming mode.
+        self.hidden_states = hidden_states
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
 
         self.finished |= next_output.finished
         self.kv_transfer_params = next_output.kv_transfer_params
+        # Latest-step semantics: overwrite with the newer hidden state.
+        if next_output.hidden_states is not None:
+            self.hidden_states = next_output.hidden_states
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):

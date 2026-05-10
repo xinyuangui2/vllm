@@ -240,6 +240,14 @@ class ModelRunnerOutput:
         default_factory=dict
     )
 
+    # paper_explore SYS1: req_id -> last-token hidden state at the
+    # configured extract layer (shape [hidden_size]). Populated only
+    # for requests with SamplingParams.extract_hidden_states=True
+    # AND when VLLM_EXTRACT_HIDDEN_STATES_LAYER is set on the worker.
+    hidden_states_dict: dict[str, torch.Tensor | None] = field(
+        default_factory=dict
+    )
+
     # [num_reqs, hidden_size]
     pooler_output: list[torch.Tensor | None] | None = None
 

@@ -149,6 +149,11 @@ class EngineCoreOutput(
     new_logprobs: LogprobsLists | None = None
     new_prompt_logprobs_tensors: LogprobsTensors | None = None
 
+    # paper_explore SYS1: when SamplingParams.extract_hidden_states is set,
+    # this carries the last-token hidden state at the configured layer
+    # (set by VLLM_EXTRACT_HIDDEN_STATES_LAYER) for the current step.
+    hidden_states: torch.Tensor | None = None
+
     pooling_output: torch.Tensor | None = None
 
     finish_reason: FinishReason | None = None
