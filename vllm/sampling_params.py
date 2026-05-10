@@ -257,6 +257,16 @@ class SamplingParams(
     it on `RequestOutput.hidden_states`. Used by the paper_explore
     head-cascade for in-flight cut-0.0 / cut-1.0 scoring. Has no
     effect when `VLLM_EXTRACT_HIDDEN_STATES_LAYER` is unset."""
+    head_cascade: bool = False
+    """When True, run the head-cascade decision inside the engine for
+    this request. Implies `extract_hidden_states=True`. The engine
+    loads the head + per-source τ table from
+    `VLLM_HEAD_CHECKPOINT_PATH` and `VLLM_HEAD_TAU_TABLE_PATH`, runs
+    the head at cut 0.0 (first decode step) and cut 1.0 (EOS / max
+    tokens), and emits a single final `RequestOutput` carrying
+    `head_decision` ∈ {"SHIP", "REGEN"}. On the REGEN path with
+    target-ViT in-engine enabled, the output also carries
+    pre-computed `target_vit_image_embeds` + `target_vit_image_grid_thw`."""
     skip_clone: bool = False
     """Internal flag indicating that this SamplingParams instance is safe to
     reuse without cloning. When True, clone() will return self without

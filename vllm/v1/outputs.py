@@ -248,6 +248,20 @@ class ModelRunnerOutput:
         default_factory=dict
     )
 
+    # paper_explore SYS1: req_id -> head-cascade decision string
+    # ∈ {"SHIP", "REGEN"}. Only present for finished cascade-enabled
+    # requests this step. SHIP_BOUND is internal engine state and
+    # never emitted (it just marks "shipping locked at cut 0.0").
+    cascade_decisions_dict: dict[str, str] = field(default_factory=dict)
+
+    # paper_explore SYS1: req_id -> (cpu image_embeds, cpu image_grid_thw)
+    # for REGEN-decision finished cascade requests this step. The engine
+    # has already synchronized on the target-ViT batch's event and
+    # moved tensors to CPU; orchestrator just reads them.
+    target_vit_payloads_dict: dict[
+        str, tuple[torch.Tensor, torch.Tensor]
+    ] = field(default_factory=dict)
+
     # [num_reqs, hidden_size]
     pooler_output: list[torch.Tensor | None] | None = None
 

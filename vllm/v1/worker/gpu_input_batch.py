@@ -240,6 +240,15 @@ class InputBatch:
         # the worker has VLLM_EXTRACT_HIDDEN_STATES_LAYER set.
         self.extract_hidden_states_reqs: set[str] = set()
 
+        # paper_explore SYS1 head-cascade: requests with
+        # SamplingParams.head_cascade=True. Cleared on remove_request.
+        self.head_cascade_reqs: set[str] = set()
+
+        # paper_explore SYS1 head-cascade: requests that locked SHIP at cut
+        # 0.0 (score_00 >= τ_L1). When the request reaches cut 1.0, its
+        # final decision is SHIP regardless of score_10.
+        self.ship_bound_reqs: set[str] = set()
+
         # To accumulate prompt logprobs tensor chunks across prefill steps.
         self.in_progress_prompt_logprobs_cpu: dict[str, LogprobsTensors] = {}
 
@@ -400,8 +409,13 @@ class InputBatch:
                     else sampling_params.logprobs
                 )
 
-            if sampling_params.extract_hidden_states:
+            if sampling_params.extract_hidden_states or sampling_params.head_cascade:
+                # head_cascade implies extract_hidden_states (the cascade
+                # needs the hidden-state hook to be active).
                 self.extract_hidden_states_reqs.add(req_id)
+
+            if sampling_params.head_cascade:
+                self.head_cascade_reqs.add(req_id)
 
             if sampling_params.allowed_token_ids:
                 self.has_allowed_token_ids.add(req_id)
@@ -531,6 +545,8 @@ class InputBatch:
         self.generators.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
         self.extract_hidden_states_reqs.discard(req_id)
+        self.head_cascade_reqs.discard(req_id)
+        self.ship_bound_reqs.discard(req_id)
         self.in_progress_prompt_logprobs_cpu.pop(req_id, None)
         if self.prev_req_id_to_index is not None:
             self.prev_req_id_to_index.pop(req_id, None)

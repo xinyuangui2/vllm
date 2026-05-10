@@ -154,6 +154,19 @@ class EngineCoreOutput(
     # (set by VLLM_EXTRACT_HIDDEN_STATES_LAYER) for the current step.
     hidden_states: torch.Tensor | None = None
 
+    # paper_explore SYS1: head-cascade decision emitted by the engine
+    # when SamplingParams.head_cascade is True. One of "SHIP" / "REGEN".
+    # Populated only on the final yield for a cascade-enabled request.
+    head_decision: str | None = None
+
+    # paper_explore SYS1: pre-encoded target-ViT outputs for REGEN path.
+    # When the engine ran the standalone target visual on stream 2 and
+    # the request decided REGEN at cut 1.0, the engine moves the
+    # embeds + grid_thw to CPU and ships them here so the orchestrator
+    # can hand them to target.regen via Ray.
+    target_vit_image_embeds: torch.Tensor | None = None
+    target_vit_image_grid_thw: torch.Tensor | None = None
+
     pooling_output: torch.Tensor | None = None
 
     finish_reason: FinishReason | None = None

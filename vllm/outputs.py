@@ -122,6 +122,9 @@ class RequestOutput:
         *,
         kv_transfer_params: dict[str, Any] | None = None,
         hidden_states: torch.Tensor | None = None,
+        head_decision: str | None = None,
+        target_vit_image_embeds: torch.Tensor | None = None,
+        target_vit_image_grid_thw: torch.Tensor | None = None,
         # Forward compatibility, code that uses args added in new release can
         # still run with older versions of vLLM without breaking.
         **kwargs: Any,
@@ -148,6 +151,13 @@ class RequestOutput:
         # or the worker isn't configured (VLLM_EXTRACT_HIDDEN_STATES_LAYER
         # unset). Updated per-step in streaming mode.
         self.hidden_states = hidden_states
+        # paper_explore SYS1: head-cascade decision on the final yield.
+        # One of "SHIP" / "REGEN" / None (not a cascade request).
+        self.head_decision = head_decision
+        # paper_explore SYS1: pre-encoded target-ViT outputs on the REGEN
+        # path. None on SHIP or when target-ViT is not configured.
+        self.target_vit_image_embeds = target_vit_image_embeds
+        self.target_vit_image_grid_thw = target_vit_image_grid_thw
 
     def add(self, next_output: "RequestOutput", aggregate: bool) -> None:
         """Merge subsequent RequestOutput into this one"""
@@ -157,6 +167,12 @@ class RequestOutput:
         # Latest-step semantics: overwrite with the newer hidden state.
         if next_output.hidden_states is not None:
             self.hidden_states = next_output.hidden_states
+        # head_decision and target_vit_* are only set on the FINAL yield
+        # for cascade requests; on merge, take the later one.
+        if next_output.head_decision is not None:
+            self.head_decision = next_output.head_decision
+            self.target_vit_image_embeds = next_output.target_vit_image_embeds
+            self.target_vit_image_grid_thw = next_output.target_vit_image_grid_thw
 
         for next_completion in next_output.outputs:
             for i, completion in enumerate(self.outputs):
