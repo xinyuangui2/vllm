@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -488,6 +489,17 @@ class GPUModelRunner(
 
         # Lazy initializations
         # self.model: nn.Module  # Set after load_model
+        # paper_explore SYS1: hidden-state extraction. Reads N from
+        # VLLM_EXTRACT_HIDDEN_STATES_LAYER (None disables); installs a
+        # post-forward hook on the Nth-from-end decoder layer in
+        # load_model(). Per-request opt-in via
+        # SamplingParams.extract_hidden_states.
+        _hsl_env = os.environ.get("VLLM_EXTRACT_HIDDEN_STATES_LAYER")
+        self._extract_hidden_states_layer: int | None = (
+            int(_hsl_env) if _hsl_env not in (None, "") else None
+        )
+        self._extract_hidden_states_hook = None
+        self._captured_hidden_states_buf: torch.Tensor | None = None
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
         # Initialize in initialize_kv_cache_tensors
@@ -3885,6 +3897,17 @@ class GPUModelRunner(
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
+            # paper_explore SYS1: extract_hidden_states hooks write to host
+            # memory inside the forward hook, which is incompatible with
+            # CUDA graph capture/replay. Force eager mode for any batch
+            # containing an opted-in request. Non-extract batches are
+            # unaffected.
+            if (
+                self._extract_hidden_states_layer is not None
+                and self.input_batch.extract_hidden_states_reqs
+            ):
+                cudagraph_mode = CUDAGraphMode.NONE
+
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
                 "should_ubatch: %s, num_tokens_across_dp: %s",
@@ -4038,6 +4061,51 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        # paper_explore SYS1: capture per-request last-token hidden state
+        # at the configured decoder layer for opted-in requests. The hook
+        # populated self._captured_hidden_states_buf during the forward;
+        # we slice with logits_indices (same per-request last-position
+        # map vLLM uses for sample_hidden_states) and ship a CPU tensor
+        # per req in hidden_states_dict.
+        hidden_states_dict: dict[str, torch.Tensor | None] = {}
+        extract_reqs = (
+            self.input_batch.extract_hidden_states_reqs
+            if self._extract_hidden_states_layer is not None
+            else set()
+        )
+        if extract_reqs and self._captured_hidden_states_buf is not None:
+            captured = self._captured_hidden_states_buf
+            self._captured_hidden_states_buf = None
+            if captured.dim() == 3:
+                # Decoder layers in V1 typically emit a flat
+                # [num_scheduled_tokens, hidden] tensor, but some wrappers
+                # return [batch, seq, hidden]. Flatten to be robust.
+                captured = captured.flatten(0, 1)
+            try:
+                last_token_hs = captured[logits_indices].to(
+                    "cpu", non_blocking=True
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "extract_hidden_states: failed to slice captured "
+                    "tensor with logits_indices (shape %s, idx len %s): %s",
+                    tuple(captured.shape),
+                    int(logits_indices.numel()) if logits_indices is not None else 0,
+                    e,
+                )
+                last_token_hs = None
+            if last_token_hs is not None:
+                req_ids_for_capture = self.input_batch.req_ids
+                # Spec decode can produce more logits than reqs; skip in
+                # that case. Draft engines (no spec decode) hit the
+                # equality path.
+                if last_token_hs.size(0) == len(req_ids_for_capture):
+                    for i, rid in enumerate(req_ids_for_capture):
+                        if rid is not None and rid in extract_reqs:
+                            hidden_states_dict[rid] = (
+                                last_token_hs[i].contiguous().clone()
+                            )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4320,6 +4388,7 @@ class GPUModelRunner(
                 sampled_token_ids=valid_sampled_token_ids,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
+                hidden_states_dict=hidden_states_dict,
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output
                 if self.supports_mm_inputs
@@ -4884,7 +4953,87 @@ class GPUModelRunner(
                     self.model, self.vllm_config, CUDAGraphMode.NONE, self.device
                 )
 
+        # paper_explore SYS1: install the extract-hidden-states forward
+        # hook on the targeted decoder layer (set via the env var
+        # VLLM_EXTRACT_HIDDEN_STATES_LAYER). Must run after the model
+        # is loaded + (optionally) wrapped — the hook is registered on
+        # the underlying eager module, but cudagraph_mode is forced to
+        # NONE for batches that opt in (see execute_model).
+        self._install_extract_hidden_states_hook()
+
         get_offloader().post_init()
+
+    def _install_extract_hidden_states_hook(self) -> None:
+        """Register a post-forward hook on `model.<...>.layers[-(N+1)]`
+        (N = `self._extract_hidden_states_layer`) that captures the
+        layer's output tensor into `self._captured_hidden_states_buf`.
+
+        Layer-path resolution is hardcoded for the Qwen2.5-VL family
+        (`model.language_model.model.layers`) with a fallback to plain
+        `model.model.layers` for LLM-only models. CUDAGraphWrapper /
+        UBatchWrapper delegate via `__getattr__`, so chained attribute
+        access works through the wrapper.
+
+        TP-safe: decoder layer outputs are post-allreduce, so all ranks
+        observe the same unsharded tensor. Only the driver's
+        ModelRunnerOutput is shipped back to the scheduler, so non-driver
+        ranks' captured tensors are simply discarded.
+        """
+        if self._extract_hidden_states_layer is None:
+            return
+        N = self._extract_hidden_states_layer
+
+        # Walk through wrappers + multimodal containers to the LLM body
+        # that holds the decoder ModuleList.
+        base = self.model
+        body = None
+        if hasattr(base, "language_model"):
+            lm = base.language_model
+            if hasattr(lm, "model") and hasattr(lm.model, "layers"):
+                body = lm.model
+        if body is None and hasattr(base, "model") and hasattr(base.model, "layers"):
+            body = base.model
+        if body is None:
+            raise RuntimeError(
+                "VLLM_EXTRACT_HIDDEN_STATES_LAYER is set but the loaded "
+                "model does not expose decoder layers at "
+                "model.language_model.model.layers or model.model.layers. "
+                f"Type={type(self.model).__name__}."
+            )
+        layers = body.layers
+        if not (0 <= N < len(layers)):
+            raise ValueError(
+                f"VLLM_EXTRACT_HIDDEN_STATES_LAYER={N} out of range for "
+                f"{len(layers)} decoder layers (must be in [0, "
+                f"{len(layers) - 1}])."
+            )
+        layer_idx = len(layers) - 1 - N
+        target_layer = layers[layer_idx]
+
+        def _hook(_module, _inputs, output):
+            # Decoder block usually returns either a tensor or a tuple
+            # whose first element is the hidden states.
+            hs = output[0] if isinstance(output, tuple) else output
+            if not torch.is_tensor(hs):
+                return
+            # Detach (we don't need autograd) and stash. Slicing +
+            # CPU copy happens after the full forward returns, in
+            # execute_model's post-forward block.
+            self._captured_hidden_states_buf = hs.detach()
+
+        if self._extract_hidden_states_hook is not None:
+            self._extract_hidden_states_hook.remove()
+        self._extract_hidden_states_hook = target_layer.register_forward_hook(
+            _hook
+        )
+        logger.info(
+            "Installed extract_hidden_states forward hook on decoder "
+            "layer %d-from-end (idx=%d of %d). Per-request opt-in via "
+            "SamplingParams.extract_hidden_states.",
+            N,
+            layer_idx,
+            len(layers),
+        )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
