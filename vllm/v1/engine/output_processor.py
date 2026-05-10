@@ -275,6 +275,9 @@ class RequestState:
         kv_transfer_params: dict[str, Any] | None = None,
         routed_experts: np.ndarray | None = None,
         hidden_states: torch.Tensor | None = None,
+        head_decision: str | None = None,
+        target_vit_image_embeds: torch.Tensor | None = None,
+        target_vit_image_grid_thw: torch.Tensor | None = None,
     ) -> RequestOutput | PoolingRequestOutput | None:
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
@@ -330,6 +333,9 @@ class RequestState:
         return self._new_request_output(
             external_req_id, outputs, finished, kv_transfer_params,
             hidden_states=hidden_states,
+            head_decision=head_decision,
+            target_vit_image_embeds=target_vit_image_embeds,
+            target_vit_image_grid_thw=target_vit_image_grid_thw,
         )
 
     def _new_request_output(
@@ -339,6 +345,9 @@ class RequestState:
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
         hidden_states: torch.Tensor | None = None,
+        head_decision: str | None = None,
+        target_vit_image_embeds: torch.Tensor | None = None,
+        target_vit_image_grid_thw: torch.Tensor | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         # If prompt embeds were used, put placeholder prompt token ids
         prompt_token_ids = self.prompt_token_ids
@@ -375,6 +384,9 @@ class RequestState:
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
             hidden_states=hidden_states,
+            head_decision=head_decision,
+            target_vit_image_embeds=target_vit_image_embeds,
+            target_vit_image_grid_thw=target_vit_image_grid_thw,
         )
 
     def _new_completion_output(
@@ -648,6 +660,13 @@ class OutputProcessor:
                 kv_transfer_params,
                 routed_experts,
                 hidden_states=engine_core_output.hidden_states,
+                head_decision=engine_core_output.head_decision,
+                target_vit_image_embeds=(
+                    engine_core_output.target_vit_image_embeds
+                ),
+                target_vit_image_grid_thw=(
+                    engine_core_output.target_vit_image_grid_thw
+                ),
             ):
                 if req_state.streaming_input:
                     request_output.finished = False

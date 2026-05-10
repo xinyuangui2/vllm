@@ -5093,6 +5093,15 @@ class GPUModelRunner(
             src: (float(v["tau_l1"]), float(v["tau_l2"]))
             for src, v in per_source.items()
         }
+        # Also stash the global cell as a fallback for heads that don't
+        # produce source predictions (e.g., the unified MLP) or for
+        # OOD sources not in per_source.
+        g = tau_raw.get("global", {})
+        if g:
+            self._tau_table["global"] = (
+                float(g.get("tau_l1", 0.5)),
+                float(g.get("tau_l2", 0.5)),
+            )
         # Source vocab in head order; argmax(source_logits) returns the
         # index, we map back via this list. The source_head training
         # script stashes this in the checkpoint as "source_vocab".

@@ -1309,6 +1309,12 @@ class Scheduler(SchedulerInterface):
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         # paper_explore SYS1: per-request last-token hidden state.
         hidden_states_dict = model_runner_output.hidden_states_dict
+        # paper_explore SYS1 head-cascade: per-request decision +
+        # (on REGEN) the pre-encoded target-ViT payload (CPU tensors).
+        cascade_decisions_dict = model_runner_output.cascade_decisions_dict
+        target_vit_payloads_dict = (
+            model_runner_output.target_vit_payloads_dict
+        )
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
@@ -1456,6 +1462,16 @@ class Scheduler(SchedulerInterface):
                 or kv_transfer_params
                 or stopped
             ):
+                # paper_explore SYS1 head-cascade: thread the per-request
+                # decision + target-ViT payload (if REGEN) into the
+                # EngineCoreOutput.
+                cascade_decision = cascade_decisions_dict.get(req_id)
+                target_vit_payload = target_vit_payloads_dict.get(req_id)
+                tv_embeds, tv_thw = (
+                    target_vit_payload if target_vit_payload is not None
+                    else (None, None)
+                )
+
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -1465,6 +1481,9 @@ class Scheduler(SchedulerInterface):
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         hidden_states=hidden_states_dict.get(req_id),
+                        head_decision=cascade_decision,
+                        target_vit_image_embeds=tv_embeds,
+                        target_vit_image_grid_thw=tv_thw,
                         pooling_output=pooler_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
