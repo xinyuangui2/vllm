@@ -500,6 +500,50 @@ class GPUModelRunner(
         )
         self._extract_hidden_states_hook = None
         self._captured_hidden_states_buf: torch.Tensor | None = None
+
+        # paper_explore SYS1 head-cascade. Loaded in load_model() when
+        # the env vars are set. Inputs:
+        #   VLLM_HEAD_CHECKPOINT_PATH       — path to head .pt file
+        #   VLLM_HEAD_TAU_TABLE_PATH        — path to per-source τ JSON
+        #                                     (e.g. cascade_per_source_tau_p_0.98.json)
+        #   VLLM_PAPER_EXPLORE_PATH         — added to sys.path so the
+        #                                     head builder + target-ViT
+        #                                     encoder modules can be imported
+        #   VLLM_TARGET_VISION_MODEL_ID     — HF id whose .visual is loaded
+        #                                     on rank-0 cuda:0 for the
+        #                                     standalone target-ViT encoder
+        self._head_ckpt_path: str | None = os.environ.get(
+            "VLLM_HEAD_CHECKPOINT_PATH"
+        ) or None
+        self._head_tau_path: str | None = os.environ.get(
+            "VLLM_HEAD_TAU_TABLE_PATH"
+        ) or None
+        self._paper_explore_path: str | None = os.environ.get(
+            "VLLM_PAPER_EXPLORE_PATH"
+        ) or None
+        self._target_vision_model_id: str | None = os.environ.get(
+            "VLLM_TARGET_VISION_MODEL_ID"
+        ) or None
+        # Lazy-loaded by load_model()
+        self._head_model = None
+        self._head_forward = None
+        self._head_temperature: float = 1.0
+        # Per-source τ tables: source_name -> (τ_L1, τ_L2). For a
+        # request with predicted source `s`, threshold τ_L1[s] at cut
+        # 0.0 and τ_L2[s] at cut 1.0.
+        self._tau_table: dict[str, tuple[float, float]] | None = None
+        # Source vocabulary in head order — used to map argmax(gate)
+        # index back to source name.
+        self._head_source_vocab: list[str] | None = None
+        # Standalone target-ViT encoder (rank-0 only).
+        self._target_vision = None
+        # Per-step set of in-flight target-ViT batches. Each entry holds
+        # a TargetVitBatch (with concat'd embeds + event + offsets).
+        self._target_vit_batches: list = []
+        self._req_to_target_vit_batch: dict[str, int] = {}
+        # EOS token ids for cut-1 detection — populated post-load.
+        self._head_eos_token_ids: set[int] = set()
+
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
         # Initialize in initialize_kv_cache_tensors
@@ -4374,6 +4418,19 @@ class GPUModelRunner(
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
+        # paper_explore SYS1 head-cascade: detect boundary requests
+        # (cut 0.0 = first decode step; cut 1.0 = EOS / max_tokens hit),
+        # run ONE batched head forward over the mixed cut subset, decide
+        # SHIP_BOUND/OPEN at cut-0 and SHIP/REGEN at cut-1. For OPEN
+        # cut-0 reqs, kick off batched target-ViT encode on stream 2.
+        # For REGEN cut-1 reqs, sync the target-ViT batch's event,
+        # slice + move payload to CPU, attach to MRO.
+        cascade_decisions_dict, target_vit_payloads_dict = (
+            self._run_head_cascade_step(
+                hidden_states_dict, valid_sampled_token_ids,
+            )
+        )
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -4389,6 +4446,8 @@ class GPUModelRunner(
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 hidden_states_dict=hidden_states_dict,
+                cascade_decisions_dict=cascade_decisions_dict,
+                target_vit_payloads_dict=target_vit_payloads_dict,
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output
                 if self.supports_mm_inputs
@@ -4961,7 +5020,431 @@ class GPUModelRunner(
         # NONE for batches that opt in (see execute_model).
         self._install_extract_hidden_states_hook()
 
+        # paper_explore SYS1 head-cascade: load the head + per-source τ
+        # table once at engine init, and the standalone target-ViT
+        # encoder if configured. All on rank-0 cuda:0 (only the driver
+        # rank produces ModelRunnerOutput, so non-driver ranks don't
+        # need these). Safe to call regardless of TP/PP setup.
+        self._load_cascade_head()
+        self._load_target_vision_encoder()
+
         get_offloader().post_init()
+
+    def _maybe_add_paper_explore_to_path(self) -> None:
+        """Add VLLM_PAPER_EXPLORE_PATH to sys.path so the head builder
+        + target-ViT modules can be imported from the paper_explore repo."""
+        import sys
+        if self._paper_explore_path and self._paper_explore_path not in sys.path:
+            sys.path.insert(0, self._paper_explore_path)
+
+    def _load_cascade_head(self) -> None:
+        """Load the trained head + per-source τ table on rank-0 cuda:0.
+        Skips silently if env vars not set (no-op for non-cascade runs)."""
+        if not (self._head_ckpt_path and self._head_tau_path):
+            return
+        if not get_pp_group().is_last_rank:
+            return
+        # Only rank 0 of TP holds the head — non-driver TP ranks don't
+        # build ModelRunnerOutput so they have no use for it.
+        from vllm.distributed import get_tp_group
+        if get_tp_group().rank_in_group != 0:
+            return
+
+        self._maybe_add_paper_explore_to_path()
+        # Re-use the existing builder in paper_explore. Falls back to a
+        # clear error if the script isn't on sys.path — caller forgot to
+        # set VLLM_PAPER_EXPLORE_PATH.
+        try:
+            from scripts.eval_classifier_head import (
+                build_model_from_ckpt,
+                _forward_logits,
+            )
+        except ImportError as e:
+            raise RuntimeError(
+                "VLLM_HEAD_CHECKPOINT_PATH is set but paper_explore's "
+                "scripts.eval_classifier_head is not importable. Set "
+                "VLLM_PAPER_EXPLORE_PATH=/path/to/paper_explore. "
+                f"Underlying: {e}"
+            )
+
+        ckpt = torch.load(
+            self._head_ckpt_path, map_location="cpu", weights_only=False,
+        )
+        cargs = ckpt["args"]
+        in_dim = int(cargs["hidden_dim"]) + int(cargs["pos_dim"])
+        domain_vocab = ckpt.get("domain_vocab", ["chat"])
+        n_domains = len(domain_vocab)
+        model, fwd = build_model_from_ckpt(ckpt, in_dim, n_domains)
+        model.load_state_dict(ckpt["state_dict"])
+        model = model.to("cuda:0").eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+        self._head_model = model
+        self._head_forward = fwd
+        self._head_temperature = float(ckpt.get("temperature", 1.0))
+
+        # τ table: cascade_per_source_tau JSON has per_source[src] →
+        # {tau_l1, tau_l2}. Plus a global cell at top level.
+        import json
+        with open(self._head_tau_path) as f:
+            tau_raw = json.load(f)
+        per_source = tau_raw.get("per_source", {})
+        self._tau_table = {
+            src: (float(v["tau_l1"]), float(v["tau_l2"]))
+            for src, v in per_source.items()
+        }
+        # Source vocab in head order; argmax(source_logits) returns the
+        # index, we map back via this list. The source_head training
+        # script stashes this in the checkpoint as "source_vocab".
+        # Fall back to sorted keys of the τ table if absent.
+        self._head_source_vocab = ckpt.get(
+            "source_vocab", sorted(self._tau_table.keys()),
+        )
+
+        # EOS ids for cut-1 detection. Pull from the tokenizer.
+        try:
+            tokenizer = self.model_config.tokenizer
+            if isinstance(tokenizer, str):
+                from transformers import AutoTokenizer
+                tokenizer = AutoTokenizer.from_pretrained(
+                    tokenizer, trust_remote_code=True,
+                )
+            eos = tokenizer.eos_token_id
+            if isinstance(eos, int):
+                self._head_eos_token_ids = {eos}
+            elif eos is not None:
+                self._head_eos_token_ids = set(eos)
+        except Exception:
+            # If the tokenizer can't be loaded here, fall back to whatever
+            # SamplingParams.stop_token_ids the user passes per request.
+            pass
+
+        logger.info(
+            "Loaded head-cascade head from %s (in_dim=%d, n_domains=%d, "
+            "tau_table=%d sources, eos_ids=%s)",
+            self._head_ckpt_path, in_dim, n_domains,
+            len(self._tau_table), self._head_eos_token_ids,
+        )
+
+    def _load_target_vision_encoder(self) -> None:
+        """Load the standalone target-ViT (Qwen2.5-VL .visual subset) on
+        rank-0 cuda:0. Skips silently if env var not set."""
+        if not self._target_vision_model_id:
+            return
+        if not get_pp_group().is_last_rank:
+            return
+        from vllm.distributed import get_tp_group
+        if get_tp_group().rank_in_group != 0:
+            return
+
+        self._maybe_add_paper_explore_to_path()
+        try:
+            from glue.target_vision import TargetVisionEncoder
+        except ImportError as e:
+            raise RuntimeError(
+                "VLLM_TARGET_VISION_MODEL_ID is set but paper_explore's "
+                "glue.target_vision is not importable. Set "
+                "VLLM_PAPER_EXPLORE_PATH=/path/to/paper_explore. "
+                f"Underlying: {e}"
+            )
+        self._target_vision = TargetVisionEncoder(
+            target_model_id=self._target_vision_model_id,
+            device="cuda:0",
+            dtype=torch.bfloat16,
+        )
+        logger.info(
+            "Loaded standalone target-ViT for head-cascade offload: %s",
+            self._target_vision_model_id,
+        )
+
+    # ------------------------------------------------------------------
+    # paper_explore SYS1 head-cascade helpers (rank-0 only)
+    # ------------------------------------------------------------------
+
+    def _is_cut0_for_req(
+        self,
+        req_id: str,
+        sampled_token_ids_for_req: list[int],
+    ) -> bool:
+        """Cut 0.0 fires on the step where the request first emits a
+        token, i.e. immediately after prefill finishes. At this point
+        scheduler hasn't appended yet, so request.output_token_ids is
+        empty and sampled_token_ids[i] is non-empty."""
+        req = self.requests.get(req_id)
+        if req is None:
+            return False
+        return (
+            len(req.output_token_ids) == 0
+            and len(sampled_token_ids_for_req) > 0
+        )
+
+    def _is_cut1_for_req(
+        self,
+        req_id: str,
+        sampled_token_ids_for_req: list[int],
+    ) -> bool:
+        """Cut 1.0 fires on the step where this request emits EOS or
+        will hit max_tokens. The actual finish-reason determination
+        happens in scheduler.update_from_output AFTER this; we
+        anticipate it by inspecting the just-sampled tokens here."""
+        req = self.requests.get(req_id)
+        if req is None or not sampled_token_ids_for_req:
+            return False
+        # EOS-style finish: any newly sampled token is in the eos set.
+        # Also honor per-request stop_token_ids from sampling_params.
+        eos_ids = set(self._head_eos_token_ids)
+        sp = req.sampling_params
+        if sp is not None and sp.stop_token_ids:
+            eos_ids.update(sp.stop_token_ids)
+        if any(tok in eos_ids for tok in sampled_token_ids_for_req):
+            return True
+        # Length-style finish.
+        new_total = len(req.output_token_ids) + len(sampled_token_ids_for_req)
+        max_tokens = sp.max_tokens if sp is not None else None
+        if max_tokens is not None and new_total >= max_tokens:
+            return True
+        return False
+
+    def _gather_mm_features_for_req(self, req_id: str):
+        """Pull pre-processed (pixel_values, image_grid_thw) for a single
+        request from CachedRequestState. Returns None if the request
+        has no multi-modal features (text-only)."""
+        req = self.requests.get(req_id)
+        if req is None or not req.mm_features:
+            return None
+        # Use the first image's features. Multi-image requests would
+        # need a join across all mm_features rows; defer that to
+        # follow-up — our 5 VLM benchmarks are single-image.
+        pv_chunks, thw_chunks = [], []
+        for mmf in req.mm_features:
+            pv = getattr(mmf, "pixel_values", None)
+            thw = getattr(mmf, "image_grid_thw", None)
+            if pv is None or thw is None:
+                continue
+            pv_chunks.append(pv)
+            thw_chunks.append(thw)
+        if not pv_chunks:
+            return None
+        if len(pv_chunks) == 1:
+            return pv_chunks[0], thw_chunks[0]
+        return (
+            torch.cat(pv_chunks, dim=0),
+            torch.cat(thw_chunks, dim=0),
+        )
+
+    def _run_head_cascade_step(
+        self,
+        hidden_states_dict: dict[str, torch.Tensor],
+        valid_sampled_token_ids: list[list[int]],
+    ) -> tuple[dict[str, str], dict[str, tuple[torch.Tensor, torch.Tensor]]]:
+        """Boundary detection + batched head forward + per-req decisions.
+
+        Returns:
+          cascade_decisions_dict: req_id -> "SHIP" | "REGEN"
+            (only for cut-1 finalized reqs this step)
+          target_vit_payloads_dict: req_id -> (cpu_image_embeds, cpu_grid_thw)
+            (only for REGEN reqs this step)
+
+        No-ops if the head isn't loaded or no cascade reqs are present.
+        """
+        if self._head_model is None:
+            return {}, {}
+        cascade_reqs = self.input_batch.head_cascade_reqs
+        if not cascade_reqs:
+            return {}, {}
+
+        req_ids = self.input_batch.req_ids
+
+        # --- 1. Build boundary mask + cuts for this step ---
+        boundary_idx: list[int] = []
+        boundary_cuts: list[float] = []
+        for i, rid in enumerate(req_ids):
+            if rid is None or rid not in cascade_reqs:
+                continue
+            if hidden_states_dict.get(rid) is None:
+                # The hook didn't capture for this req (shouldn't happen
+                # because head_cascade implies extract_hidden_states, but
+                # be defensive).
+                continue
+            sampled = valid_sampled_token_ids[i] if i < len(valid_sampled_token_ids) else []
+            is_c0 = self._is_cut0_for_req(rid, sampled)
+            is_c1 = self._is_cut1_for_req(rid, sampled)
+            if is_c0:
+                boundary_idx.append(i)
+                boundary_cuts.append(0.0)
+            if is_c1:
+                # A request CAN be both cut 0 and cut 1 in the same step
+                # (e.g., max_tokens=1 with first token = EOS). Add a
+                # second entry — cut-0 is processed first below.
+                boundary_idx.append(i)
+                boundary_cuts.append(1.0)
+
+        if not boundary_idx:
+            return {}, {}
+
+        # --- 2. Stack hidden states + ONE batched head forward ---
+        device = torch.device("cuda:0")
+        hs_list = []
+        for j, i in enumerate(boundary_idx):
+            hs_list.append(
+                hidden_states_dict[req_ids[i]].to(device, non_blocking=True)
+            )
+        hs_batch = torch.stack(hs_list, dim=0)  # [N_boundary, hidden_dim]
+
+        # Concat position-fraction (t/T) feature: 0.0 for cut-0, 1.0
+        # for cut-1. Existing head was trained with this feature.
+        pos = torch.tensor(
+            boundary_cuts, dtype=hs_batch.dtype, device=device,
+        ).unsqueeze(-1)
+        x = torch.cat([hs_batch.to(torch.float32), pos.to(torch.float32)], dim=-1)
+
+        with torch.inference_mode():
+            logits, source_logits = self._head_forward(self._head_model, x)
+            scores = torch.sigmoid(logits / self._head_temperature)
+            if source_logits is not None:
+                src_pred = torch.argmax(source_logits, dim=-1)
+            else:
+                src_pred = torch.zeros(
+                    len(boundary_idx), dtype=torch.long, device=device,
+                )
+
+        # --- 3. Vectorized decisions ---
+        # Build per-source τ vectors aligned with self._head_source_vocab.
+        if not hasattr(self, "_tau_l1_gpu") or self._tau_l1_gpu is None:
+            tl1, tl2 = [], []
+            for s in self._head_source_vocab:
+                v = self._tau_table.get(s) or self._tau_table.get(
+                    "global", (0.5, 0.5),
+                )
+                tl1.append(v[0])
+                tl2.append(v[1])
+            self._tau_l1_gpu = torch.tensor(tl1, dtype=torch.float32, device=device)
+            self._tau_l2_gpu = torch.tensor(tl2, dtype=torch.float32, device=device)
+
+        is_cut0 = torch.tensor(
+            [c == 0.0 for c in boundary_cuts], dtype=torch.bool, device=device,
+        )
+        tau_per = torch.where(
+            is_cut0,
+            self._tau_l1_gpu[src_pred],
+            self._tau_l2_gpu[src_pred],
+        )
+
+        prev_ship_bound_cpu = torch.tensor(
+            [(req_ids[boundary_idx[j]] in self.input_batch.ship_bound_reqs)
+             for j in range(len(boundary_idx))],
+            dtype=torch.bool, device=device,
+        )
+        passes = scores >= tau_per
+        # Decision codes:
+        #   0 = SHIP_BOUND (cut-0 only)
+        #   1 = OPEN       (cut-0 only)
+        #   2 = SHIP       (cut-1 only)
+        #   3 = REGEN      (cut-1 only)
+        decision_codes = torch.where(
+            is_cut0,
+            torch.where(passes, 0, 1),
+            torch.where(prev_ship_bound_cpu | passes, 2, 3),
+        ).tolist()
+
+        # Pull CPU scalars for source indexing
+        src_pred_cpu = src_pred.tolist()
+
+        # --- 4. Process per-req: state updates, target-ViT dispatch,
+        # final-decision emission ---
+        cascade_decisions: dict[str, str] = {}
+        target_vit_payloads: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+        open_reqs_for_encode: list[tuple[str, int]] = []  # (req_id, source_idx)
+        for j, code in enumerate(decision_codes):
+            i = boundary_idx[j]
+            rid = req_ids[i]
+            if code == 0:                            # SHIP_BOUND
+                self.input_batch.ship_bound_reqs.add(rid)
+            elif code == 1:                          # OPEN
+                open_reqs_for_encode.append((rid, src_pred_cpu[j]))
+            elif code == 2:                          # SHIP
+                cascade_decisions[rid] = "SHIP"
+                # Cancel any pending target-vit slot for this req
+                self._drop_target_vit_payload(rid)
+            elif code == 3:                          # REGEN
+                cascade_decisions[rid] = "REGEN"
+                payload = self._consume_target_vit_payload(rid)
+                if payload is not None:
+                    target_vit_payloads[rid] = payload
+
+        # --- 5. Batched target-ViT encode for OPEN cut-0 reqs ---
+        if open_reqs_for_encode and self._target_vision is not None:
+            pv_list, thw_list, kept = [], [], []
+            for rid, _ in open_reqs_for_encode:
+                mm = self._gather_mm_features_for_req(rid)
+                if mm is None:
+                    continue
+                pv, thw = mm
+                pv_list.append(pv)
+                thw_list.append(thw)
+                kept.append(rid)
+            if pv_list:
+                batch = self._target_vision.encode_async_batched_pre_processed(
+                    pv_list, thw_list,
+                )
+                # Register batch + req->slice mapping. The kept order is
+                # the same as the offsets_tokens / offsets_images order.
+                batch_meta = {
+                    "req_ids": kept,
+                    "batch": batch,
+                }
+                idx = len(self._target_vit_batches)
+                self._target_vit_batches.append(batch_meta)
+                for r in kept:
+                    self._req_to_target_vit_batch[r] = idx
+
+        return cascade_decisions, target_vit_payloads
+
+    def _consume_target_vit_payload(
+        self, req_id: str,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Slice this req's image_embeds + grid_thw from its batch,
+        synchronize the batch event, move to CPU, and free the slot.
+        Returns None if the req was never registered (e.g., SHIP_BOUND
+        path)."""
+        idx = self._req_to_target_vit_batch.pop(req_id, None)
+        if idx is None:
+            return None
+        meta = self._target_vit_batches[idx]
+        batch = meta["batch"]
+        # Find this req's position within the batch
+        j = meta["req_ids"].index(req_id)
+        # Block (briefly) until target-vit finishes. In practice the
+        # batch was issued at an earlier vLLM step and has had ~200-500
+        # ms of overlap with decode — usually already done.
+        batch.event.synchronize()
+        s_t = batch.offsets_tokens[j]
+        e_t = batch.offsets_tokens[j + 1]
+        s_i = batch.offsets_images[j]
+        e_i = batch.offsets_images[j + 1]
+        embeds = batch.image_embeds[s_t:e_t].contiguous().cpu()
+        thw = batch.image_grid_thw[s_i:e_i].contiguous().cpu()
+        # Cleanup: if this was the last req in the batch, free the slot
+        meta["req_ids"][j] = None
+        if all(x is None for x in meta["req_ids"]):
+            self._target_vit_batches[idx] = None
+        return embeds, thw
+
+    def _drop_target_vit_payload(self, req_id: str) -> None:
+        """SHIP path: discard any pending target-vit slot. GPU memory
+        for the batch frees naturally when the last slot is consumed
+        or via the next __init__-time reset."""
+        idx = self._req_to_target_vit_batch.pop(req_id, None)
+        if idx is None:
+            return
+        meta = self._target_vit_batches[idx]
+        if meta is None:
+            return
+        j = meta["req_ids"].index(req_id)
+        meta["req_ids"][j] = None
+        if all(x is None for x in meta["req_ids"]):
+            self._target_vit_batches[idx] = None
 
     def _install_extract_hidden_states_hook(self) -> None:
         """Register a post-forward hook on `model.<...>.layers[-(N+1)]`
