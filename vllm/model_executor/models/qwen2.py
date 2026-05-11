@@ -438,22 +438,53 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
-        # paper_explore SYS1 inline capture: when the engine has installed
-        # an extract buffer + target layer index on this module, write
-        # the targeted decoder layer's `hidden_states` into the buffer.
-        # CUDA-graph-safe (the copy_ is just another captured kernel).
+        # paper_explore SYS1: the engine may install (a) a hidden-state
+        # extract buffer + target layer index, and (b) a cascade head
+        # (multitask MLP) + pre-allocated score/src buffers + constant
+        # pos0/pos1 columns. Both fire at the targeted decoder layer.
+        # CUDA-graph-safe: all writes are into pre-allocated buffers.
         extract_buf = getattr(self, "_paper_explore_extract_buf", None)
         extract_layer_idx = getattr(self, "_paper_explore_extract_layer_idx", -1)
+        cascade_head = getattr(self, "_paper_explore_head", None)
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
             hidden_states, residual = layer(positions, hidden_states, residual)
             if extract_buf is not None and idx == extract_layer_idx:
-                # Write rows [0..num_tokens) of the buffer. The buffer
-                # was pre-allocated at max_num_batched_tokens; the engine
-                # slices [:num_scheduled_tokens] post-forward.
+                # Capture: write rows [0..num_tokens) of the buffer. The
+                # engine slices [:num_scheduled_tokens] post-forward.
                 n = hidden_states.shape[0]
                 extract_buf[:n].copy_(hidden_states)
+                if cascade_head is not None:
+                    # Speculatively run head at pos_frac=0.0 AND pos_frac=1.0
+                    # over ALL token positions. Engine picks the per-req
+                    # last-position score post-forward via logits_indices,
+                    # and chooses pos=0 score at cut-0 boundary / pos=1
+                    # score at cut-1 boundary.
+                    fwd = self._paper_explore_head_forward
+                    T = self._paper_explore_head_temperature
+                    x0 = torch.cat(
+                        [hidden_states, self._pos0_col[:n]], dim=-1,
+                    )
+                    x1 = torch.cat(
+                        [hidden_states, self._pos1_col[:n]], dim=-1,
+                    )
+                    score0_logits, src_logits = fwd(cascade_head, x0)
+                    score1_logits, _ = fwd(cascade_head, x1)
+                    if score0_logits.dim() > 1:
+                        score0_logits = score0_logits.squeeze(-1)
+                        score1_logits = score1_logits.squeeze(-1)
+                    self._score0_buf[:n].copy_(
+                        torch.sigmoid(score0_logits.float() / T)
+                    )
+                    self._score1_buf[:n].copy_(
+                        torch.sigmoid(score1_logits.float() / T)
+                    )
+                    if src_logits is not None:
+                        self._src_buf[:n].copy_(src_logits.argmax(dim=-1))
+                    # else: single-task head — _src_buf left at zeros, all
+                    # reqs map to source index 0 (engine falls back to
+                    # τ_table["global"] if present).
             self._maybe_add_hidden_state(
                 aux_hidden_states, idx + 1, hidden_states, residual
             )

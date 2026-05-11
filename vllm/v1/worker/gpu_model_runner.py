@@ -547,6 +547,17 @@ class GPUModelRunner(
         self._req_to_target_vit_batch: dict[str, int] = {}
         # EOS token ids for cut-1 detection — populated post-load.
         self._head_eos_token_ids: set[int] = set()
+        # paper_explore SYS1 cascade: handles to the score / src buffers
+        # the model writes during forward. Set by _load_cascade_head().
+        # None when no cascade is configured.
+        self._cascade_score0_buf: torch.Tensor | None = None
+        self._cascade_score1_buf: torch.Tensor | None = None
+        self._cascade_src_buf: torch.Tensor | None = None
+        # Per-req cut-0 stash: at the first decode step we record the
+        # cut-0 score + predicted source; at cut-1 we pop and combine
+        # with the cut-1 score for the OR-skip decision.
+        self._stashed_score0: dict[str, float] = {}
+        self._stashed_src: dict[str, int] = {}
 
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
@@ -4414,16 +4425,17 @@ class GPUModelRunner(
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
-        # paper_explore SYS1 head-cascade: detect boundary requests
-        # (cut 0.0 = first decode step; cut 1.0 = EOS / max_tokens hit),
-        # run ONE batched head forward over the mixed cut subset, decide
-        # SHIP_BOUND/OPEN at cut-0 and SHIP/REGEN at cut-1. For OPEN
-        # cut-0 reqs, kick off batched target-ViT encode on stream 2.
-        # For REGEN cut-1 reqs, sync the target-ViT batch's event,
-        # slice + move payload to CPU, attach to MRO.
+        # paper_explore SYS1 head-cascade: the head already ran INSIDE
+        # Qwen2Model.forward at the targeted layer (scores in the
+        # model's pre-allocated buffers). Here we just detect boundary
+        # requests (cut 0.0 / cut 1.0), apply the OR-skip rule using
+        # stashed cut-0 scores + this step's cut-1 scores, and dispatch
+        # target-ViT for cut-0 reqs (always, no head-gating).
         cascade_decisions_dict, target_vit_payloads_dict = (
             self._run_head_cascade_step(
-                hidden_states_dict, valid_sampled_token_ids,
+                valid_sampled_token_ids,
+                logits_indices,
+                num_tokens_unpadded,
             )
         )
 
@@ -5122,11 +5134,63 @@ class GPUModelRunner(
             # SamplingParams.stop_token_ids the user passes per request.
             pass
 
+        # Install head + score / src / pos buffers on the LLM body so
+        # the head runs INSIDE Qwen2Model.forward at the targeted layer
+        # (CUDA-graph-captured). The engine reads from these buffers
+        # post-forward via logits_indices instead of running the head
+        # itself.
+        body = self._resolve_llm_body()
+        max_tokens = self.scheduler_config.max_num_batched_tokens
+        device = torch.device("cuda:0")
+        # Pos columns in the same dtype as the hidden states so cat
+        # without upcast.
+        body._paper_explore_head = model
+        body._paper_explore_head_forward = fwd
+        body._paper_explore_head_temperature = self._head_temperature
+        body._pos0_col = torch.zeros(
+            (max_tokens, 1), dtype=self.dtype, device=device,
+        )
+        body._pos1_col = torch.ones(
+            (max_tokens, 1), dtype=self.dtype, device=device,
+        )
+        # Scores are post-sigmoid in [0, 1]; keep them in float32 for
+        # decision comparisons against τ (also float32).
+        body._score0_buf = torch.zeros(
+            max_tokens, dtype=torch.float32, device=device,
+        )
+        body._score1_buf = torch.zeros(
+            max_tokens, dtype=torch.float32, device=device,
+        )
+        body._src_buf = torch.zeros(
+            max_tokens, dtype=torch.long, device=device,
+        )
+        # Stash engine-side handles for fast access in execute_model.
+        self._cascade_score0_buf = body._score0_buf
+        self._cascade_score1_buf = body._score1_buf
+        self._cascade_src_buf = body._src_buf
+
         logger.info(
             "Loaded head-cascade head from %s (in_dim=%d, n_domains=%d, "
-            "tau_table=%d sources, eos_ids=%s)",
+            "tau_table=%d sources, eos_ids=%s) — head runs inline "
+            "inside Qwen2Model.forward; graph-captured.",
             self._head_ckpt_path, in_dim, n_domains,
             len(self._tau_table), self._head_eos_token_ids,
+        )
+
+    def _resolve_llm_body(self):
+        """Walk through CUDAGraphWrapper / VL wrapper attributes to the
+        LLM body (the Qwen2Model holding the decoder ModuleList)."""
+        base = self.model
+        if hasattr(base, "language_model"):
+            lm = base.language_model
+            if hasattr(lm, "model") and hasattr(lm.model, "layers"):
+                return lm.model
+        if hasattr(base, "model") and hasattr(base.model, "layers"):
+            return base.model
+        raise RuntimeError(
+            "Could not locate decoder body. Expected "
+            "model.language_model.model.layers or model.model.layers. "
+            f"Type={type(self.model).__name__}."
         )
 
     def _load_target_vision_encoder(self) -> None:
@@ -5237,20 +5301,35 @@ class GPUModelRunner(
 
     def _run_head_cascade_step(
         self,
-        hidden_states_dict: dict[str, torch.Tensor],
         valid_sampled_token_ids: list[list[int]],
+        logits_indices: torch.Tensor,
+        num_tokens_unpadded: int,
     ) -> tuple[dict[str, str], dict[str, tuple[torch.Tensor, torch.Tensor]]]:
-        """Boundary detection + batched head forward + per-req decisions.
+        """Per-request decisions for cascade-enabled requests.
+
+        The model already ran the head INSIDE Qwen2Model.forward at
+        the targeted layer over all positions, at both pos_frac=0.0
+        and pos_frac=1.0. Score tensors live at
+        body._score0_buf / _score1_buf / _src_buf (handles on self).
+        This step just reads them via logits_indices and applies the
+        OR-skip rule using per-req boundary detection.
+
+        Engine policy:
+          - At cut 0.0 (first decode step): stash score_at_pos0 +
+            predicted source, ALWAYS dispatch target-ViT (no cut-0
+            short-circuit — target-ViT is always speculatively encoded
+            during draft decode).
+          - At cut 1.0 (EOS / max_tokens): pop stashed s00; combine
+            with this step's s10; apply OR-skip:
+              ship iff s00 ≥ τ_L1[src] OR s10 ≥ τ_L2[src]
+            On SHIP, drop the target-ViT slot. On REGEN, consume the
+            payload (sync event, slice, CPU).
 
         Returns:
           cascade_decisions_dict: req_id -> "SHIP" | "REGEN"
-            (only for cut-1 finalized reqs this step)
           target_vit_payloads_dict: req_id -> (cpu_image_embeds, cpu_grid_thw)
-            (only for REGEN reqs this step)
-
-        No-ops if the head isn't loaded or no cascade reqs are present.
         """
-        if self._head_model is None:
+        if self._cascade_score0_buf is None:
             return {}, {}
         cascade_reqs = self.input_batch.head_cascade_reqs
         if not cascade_reqs:
@@ -5258,128 +5337,73 @@ class GPUModelRunner(
 
         req_ids = self.input_batch.req_ids
 
-        # --- 1. Build boundary mask + cuts for this step ---
-        boundary_idx: list[int] = []
-        boundary_cuts: list[float] = []
+        # Read per-req last-position scores from the model's buffers.
+        # logits_indices selects the per-req last-position slot in the
+        # flat [num_tokens] buffer; transferring [num_reqs] floats is
+        # ~µs CPU cost.
+        s0_per_req = self._cascade_score0_buf[
+            :num_tokens_unpadded
+        ][logits_indices].tolist()
+        s1_per_req = self._cascade_score1_buf[
+            :num_tokens_unpadded
+        ][logits_indices].tolist()
+        src_per_req = self._cascade_src_buf[
+            :num_tokens_unpadded
+        ][logits_indices].tolist()
+
+        cascade_decisions: dict[str, str] = {}
+        target_vit_payloads: dict[
+            str, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        cut0_reqs_for_encode: list[str] = []
+
         for i, rid in enumerate(req_ids):
             if rid is None or rid not in cascade_reqs:
                 continue
-            if hidden_states_dict.get(rid) is None:
-                # The hook didn't capture for this req (shouldn't happen
-                # because head_cascade implies extract_hidden_states, but
-                # be defensive).
-                continue
-            sampled = valid_sampled_token_ids[i] if i < len(valid_sampled_token_ids) else []
+            sampled = (
+                valid_sampled_token_ids[i]
+                if i < len(valid_sampled_token_ids) else []
+            )
             is_c0 = self._is_cut0_for_req(rid, sampled)
             is_c1 = self._is_cut1_for_req(rid, sampled)
+
             if is_c0:
-                boundary_idx.append(i)
-                boundary_cuts.append(0.0)
+                # Stash the cut-0 score + predicted source. Always queue
+                # for target-ViT encode regardless of the score value
+                # (no head-gated dispatch — see commit message).
+                self._stashed_score0[rid] = float(s0_per_req[i])
+                self._stashed_src[rid] = int(src_per_req[i])
+                cut0_reqs_for_encode.append(rid)
+
             if is_c1:
-                # A request CAN be both cut 0 and cut 1 in the same step
-                # (e.g., max_tokens=1 with first token = EOS). Add a
-                # second entry — cut-0 is processed first below.
-                boundary_idx.append(i)
-                boundary_cuts.append(1.0)
-
-        if not boundary_idx:
-            return {}, {}
-
-        # --- 2. Stack hidden states + ONE batched head forward ---
-        device = torch.device("cuda:0")
-        hs_list = []
-        for j, i in enumerate(boundary_idx):
-            hs_list.append(
-                hidden_states_dict[req_ids[i]].to(device, non_blocking=True)
-            )
-        hs_batch = torch.stack(hs_list, dim=0)  # [N_boundary, hidden_dim]
-
-        # Concat position-fraction (t/T) feature: 0.0 for cut-0, 1.0
-        # for cut-1. Existing head was trained with this feature.
-        pos = torch.tensor(
-            boundary_cuts, dtype=hs_batch.dtype, device=device,
-        ).unsqueeze(-1)
-        x = torch.cat([hs_batch.to(torch.float32), pos.to(torch.float32)], dim=-1)
-
-        with torch.inference_mode():
-            logits, source_logits = self._head_forward(self._head_model, x)
-            scores = torch.sigmoid(logits / self._head_temperature)
-            if source_logits is not None:
-                src_pred = torch.argmax(source_logits, dim=-1)
-            else:
-                src_pred = torch.zeros(
-                    len(boundary_idx), dtype=torch.long, device=device,
+                # Apply OR-skip with stashed s00 + this step's s10.
+                s00 = self._stashed_score0.pop(rid, None)
+                src_idx = self._stashed_src.pop(rid, 0)
+                s10 = float(s1_per_req[i])
+                src_name = (
+                    self._head_source_vocab[src_idx]
+                    if (self._head_source_vocab is not None
+                        and 0 <= src_idx < len(self._head_source_vocab))
+                    else "global"
                 )
-
-        # --- 3. Vectorized decisions ---
-        # Build per-source τ vectors aligned with self._head_source_vocab.
-        if not hasattr(self, "_tau_l1_gpu") or self._tau_l1_gpu is None:
-            tl1, tl2 = [], []
-            for s in self._head_source_vocab:
-                v = self._tau_table.get(s) or self._tau_table.get(
-                    "global", (0.5, 0.5),
+                tau_l1, tau_l2 = self._tau_table.get(
+                    src_name,
+                    self._tau_table.get("global", (0.5, 0.5)),
                 )
-                tl1.append(v[0])
-                tl2.append(v[1])
-            self._tau_l1_gpu = torch.tensor(tl1, dtype=torch.float32, device=device)
-            self._tau_l2_gpu = torch.tensor(tl2, dtype=torch.float32, device=device)
+                if (s00 is not None and s00 >= tau_l1) or (s10 >= tau_l2):
+                    cascade_decisions[rid] = "SHIP"
+                    self._drop_target_vit_payload(rid)
+                else:
+                    cascade_decisions[rid] = "REGEN"
+                    payload = self._consume_target_vit_payload(rid)
+                    if payload is not None:
+                        target_vit_payloads[rid] = payload
 
-        is_cut0 = torch.tensor(
-            [c == 0.0 for c in boundary_cuts], dtype=torch.bool, device=device,
-        )
-        tau_per = torch.where(
-            is_cut0,
-            self._tau_l1_gpu[src_pred],
-            self._tau_l2_gpu[src_pred],
-        )
-
-        prev_ship_bound_cpu = torch.tensor(
-            [(req_ids[boundary_idx[j]] in self.input_batch.ship_bound_reqs)
-             for j in range(len(boundary_idx))],
-            dtype=torch.bool, device=device,
-        )
-        passes = scores >= tau_per
-        # Decision codes:
-        #   0 = SHIP_BOUND (cut-0 only)
-        #   1 = OPEN       (cut-0 only)
-        #   2 = SHIP       (cut-1 only)
-        #   3 = REGEN      (cut-1 only)
-        decision_codes = torch.where(
-            is_cut0,
-            torch.where(passes, 0, 1),
-            torch.where(prev_ship_bound_cpu | passes, 2, 3),
-        ).tolist()
-
-        # Pull CPU scalars for source indexing
-        src_pred_cpu = src_pred.tolist()
-
-        # --- 4. Process per-req: state updates, target-ViT dispatch,
-        # final-decision emission ---
-        cascade_decisions: dict[str, str] = {}
-        target_vit_payloads: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-
-        open_reqs_for_encode: list[tuple[str, int]] = []  # (req_id, source_idx)
-        for j, code in enumerate(decision_codes):
-            i = boundary_idx[j]
-            rid = req_ids[i]
-            if code == 0:                            # SHIP_BOUND
-                self.input_batch.ship_bound_reqs.add(rid)
-            elif code == 1:                          # OPEN
-                open_reqs_for_encode.append((rid, src_pred_cpu[j]))
-            elif code == 2:                          # SHIP
-                cascade_decisions[rid] = "SHIP"
-                # Cancel any pending target-vit slot for this req
-                self._drop_target_vit_payload(rid)
-            elif code == 3:                          # REGEN
-                cascade_decisions[rid] = "REGEN"
-                payload = self._consume_target_vit_payload(rid)
-                if payload is not None:
-                    target_vit_payloads[rid] = payload
-
-        # --- 5. Batched target-ViT encode for OPEN cut-0 reqs ---
-        if open_reqs_for_encode and self._target_vision is not None:
+        # Batched target-ViT dispatch for the step's cut-0 reqs.
+        # ALWAYS fires (no head-gating) — see PR design notes.
+        if cut0_reqs_for_encode and self._target_vision is not None:
             pv_list, thw_list, kept = [], [], []
-            for rid, _ in open_reqs_for_encode:
+            for rid in cut0_reqs_for_encode:
                 mm = self._gather_mm_features_for_req(rid)
                 if mm is None:
                     continue
@@ -5388,15 +5412,12 @@ class GPUModelRunner(
                 thw_list.append(thw)
                 kept.append(rid)
             if pv_list:
-                batch = self._target_vision.encode_async_batched_pre_processed(
-                    pv_list, thw_list,
+                batch = (
+                    self._target_vision.encode_async_batched_pre_processed(
+                        pv_list, thw_list,
+                    )
                 )
-                # Register batch + req->slice mapping. The kept order is
-                # the same as the offsets_tokens / offsets_images order.
-                batch_meta = {
-                    "req_ids": kept,
-                    "batch": batch,
-                }
+                batch_meta = {"req_ids": kept, "batch": batch}
                 idx = len(self._target_vit_batches)
                 self._target_vit_batches.append(batch_meta)
                 for r in kept:
@@ -5478,23 +5499,7 @@ class GPUModelRunner(
             return
         N = self._extract_hidden_states_layer
 
-        # Walk through wrappers + multimodal containers to the LLM body
-        # that holds the decoder ModuleList.
-        base = self.model
-        body = None
-        if hasattr(base, "language_model"):
-            lm = base.language_model
-            if hasattr(lm, "model") and hasattr(lm.model, "layers"):
-                body = lm.model
-        if body is None and hasattr(base, "model") and hasattr(base.model, "layers"):
-            body = base.model
-        if body is None:
-            raise RuntimeError(
-                "VLLM_EXTRACT_HIDDEN_STATES_LAYER is set but the loaded "
-                "model does not expose decoder layers at "
-                "model.language_model.model.layers or model.model.layers. "
-                f"Type={type(self.model).__name__}."
-            )
+        body = self._resolve_llm_body()
         layers = body.layers
         if not (0 <= N < len(layers)):
             raise ValueError(

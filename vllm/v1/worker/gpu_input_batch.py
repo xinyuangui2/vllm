@@ -242,12 +242,10 @@ class InputBatch:
 
         # paper_explore SYS1 head-cascade: requests with
         # SamplingParams.head_cascade=True. Cleared on remove_request.
+        # (No SHIP_BOUND tracking — under the simplified always-dispatch-
+        # target-ViT design, the cut-0 score is just stashed and the
+        # OR-skip decision is evaluated at cut-1 in gpu_model_runner.)
         self.head_cascade_reqs: set[str] = set()
-
-        # paper_explore SYS1 head-cascade: requests that locked SHIP at cut
-        # 0.0 (score_00 >= τ_L1). When the request reaches cut 1.0, its
-        # final decision is SHIP regardless of score_10.
-        self.ship_bound_reqs: set[str] = set()
 
         # To accumulate prompt logprobs tensor chunks across prefill steps.
         self.in_progress_prompt_logprobs_cpu: dict[str, LogprobsTensors] = {}
@@ -546,7 +544,6 @@ class InputBatch:
         self.num_logprobs.pop(req_id, None)
         self.extract_hidden_states_reqs.discard(req_id)
         self.head_cascade_reqs.discard(req_id)
-        self.ship_bound_reqs.discard(req_id)
         self.in_progress_prompt_logprobs_cpu.pop(req_id, None)
         if self.prev_req_id_to_index is not None:
             self.prev_req_id_to_index.pop(req_id, None)
