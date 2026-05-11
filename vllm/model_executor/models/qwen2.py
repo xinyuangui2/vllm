@@ -438,10 +438,22 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        # paper_explore SYS1 inline capture: when the engine has installed
+        # an extract buffer + target layer index on this module, write
+        # the targeted decoder layer's `hidden_states` into the buffer.
+        # CUDA-graph-safe (the copy_ is just another captured kernel).
+        extract_buf = getattr(self, "_paper_explore_extract_buf", None)
+        extract_layer_idx = getattr(self, "_paper_explore_extract_layer_idx", -1)
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer)
         ):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if extract_buf is not None and idx == extract_layer_idx:
+                # Write rows [0..num_tokens) of the buffer. The buffer
+                # was pre-allocated at max_num_batched_tokens; the engine
+                # slices [:num_scheduled_tokens] post-forward.
+                n = hidden_states.shape[0]
+                extract_buf[:n].copy_(hidden_states)
             self._maybe_add_hidden_state(
                 aux_hidden_states, idx + 1, hidden_states, residual
             )

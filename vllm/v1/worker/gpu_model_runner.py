@@ -498,7 +498,11 @@ class GPUModelRunner(
         self._extract_hidden_states_layer: int | None = (
             int(_hsl_env) if _hsl_env not in (None, "") else None
         )
-        self._extract_hidden_states_hook = None
+        # paper_explore SYS1: persistent buffer holding the targeted
+        # decoder layer's hidden states. Written inline by the model's
+        # forward (see Qwen2Model.forward), read post-forward in
+        # execute_model. Allocated once in _install_extract_hidden_states_buf
+        # at engine init, reused across steps — CUDA-graph-safe.
         self._captured_hidden_states_buf: torch.Tensor | None = None
 
         # paper_explore SYS1 head-cascade. Loaded in load_model() when
@@ -3941,16 +3945,11 @@ class GPUModelRunner(
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
 
-            # paper_explore SYS1: extract_hidden_states hooks write to host
-            # memory inside the forward hook, which is incompatible with
-            # CUDA graph capture/replay. Force eager mode for any batch
-            # containing an opted-in request. Non-extract batches are
-            # unaffected.
-            if (
-                self._extract_hidden_states_layer is not None
-                and self.input_batch.extract_hidden_states_reqs
-            ):
-                cudagraph_mode = CUDAGraphMode.NONE
+            # paper_explore SYS1: the inline extract-hidden-states capture
+            # writes to a persistent buffer, which IS CUDA-graph-safe.
+            # No cudagraph_mode override needed (this used to force NONE
+            # under the forward-hook design — removed when we moved to
+            # inline capture in Qwen2Model.forward).
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -4106,12 +4105,13 @@ class GPUModelRunner(
                 **model_kwargs,
             )
 
-        # paper_explore SYS1: capture per-request last-token hidden state
-        # at the configured decoder layer for opted-in requests. The hook
-        # populated self._captured_hidden_states_buf during the forward;
-        # we slice with logits_indices (same per-request last-position
-        # map vLLM uses for sample_hidden_states) and ship a CPU tensor
-        # per req in hidden_states_dict.
+        # paper_explore SYS1: read per-request last-token hidden state
+        # from the persistent inline-capture buffer. The model's forward
+        # wrote rows [0..num_scheduled_tokens) of this buffer at the
+        # configured decoder layer (see Qwen2Model.forward). We slice
+        # with logits_indices (same per-request last-position map vLLM
+        # uses for sample_hidden_states) and ship a CPU tensor per req
+        # in hidden_states_dict.
         hidden_states_dict: dict[str, torch.Tensor | None] = {}
         extract_reqs = (
             self.input_batch.extract_hidden_states_reqs
@@ -4119,13 +4119,9 @@ class GPUModelRunner(
             else set()
         )
         if extract_reqs and self._captured_hidden_states_buf is not None:
-            captured = self._captured_hidden_states_buf
-            self._captured_hidden_states_buf = None
-            if captured.dim() == 3:
-                # Decoder layers in V1 typically emit a flat
-                # [num_scheduled_tokens, hidden] tensor, but some wrappers
-                # return [batch, seq, hidden]. Flatten to be robust.
-                captured = captured.flatten(0, 1)
+            # Only the first num_scheduled_tokens rows were written this
+            # step. logits_indices indexes into that range.
+            captured = self._captured_hidden_states_buf[:num_tokens_unpadded]
             try:
                 last_token_hs = captured[logits_indices].to(
                     "cpu", non_blocking=True
@@ -5012,13 +5008,11 @@ class GPUModelRunner(
                     self.model, self.vllm_config, CUDAGraphMode.NONE, self.device
                 )
 
-        # paper_explore SYS1: install the extract-hidden-states forward
-        # hook on the targeted decoder layer (set via the env var
-        # VLLM_EXTRACT_HIDDEN_STATES_LAYER). Must run after the model
-        # is loaded + (optionally) wrapped — the hook is registered on
-        # the underlying eager module, but cudagraph_mode is forced to
-        # NONE for batches that opt in (see execute_model).
-        self._install_extract_hidden_states_hook()
+        # paper_explore SYS1: allocate a persistent extract buffer and
+        # stash it on the LLM body so model.forward writes inline at
+        # the targeted layer. CUDA-graph-safe (no Python hook, no
+        # cudagraph_mode override required).
+        self._install_extract_hidden_states_buf()
 
         # paper_explore SYS1 head-cascade: load the head + per-source τ
         # table once at engine init, and the standalone target-ViT
@@ -5455,16 +5449,25 @@ class GPUModelRunner(
         if all(x is None for x in meta["req_ids"]):
             self._target_vit_batches[idx] = None
 
-    def _install_extract_hidden_states_hook(self) -> None:
-        """Register a post-forward hook on `model.<...>.layers[-(N+1)]`
-        (N = `self._extract_hidden_states_layer`) that captures the
-        layer's output tensor into `self._captured_hidden_states_buf`.
+    def _install_extract_hidden_states_buf(self) -> None:
+        """paper_explore SYS1: allocate a fixed buffer on rank-0 cuda:0
+        and stash a reference on the LLM body module so the model's
+        forward writes the targeted decoder layer's hidden states
+        inline (no PyTorch hook needed).
+
+        Pros vs the previous forward-hook design:
+          * Buffer write is a CUDA op like any other — captured into
+            CUDA graphs naturally. Cascade requests can keep
+            PIECEWISE / FULL cudagraph_mode; we drop the forced
+            eager fallback.
+          * No hook attach/detach lifecycle.
+          * Data flow is explicit in the model file (~5 LoC inline
+            capture in Qwen2Model.forward).
 
         Layer-path resolution is hardcoded for the Qwen2.5-VL family
         (`model.language_model.model.layers`) with a fallback to plain
         `model.model.layers` for LLM-only models. CUDAGraphWrapper /
-        UBatchWrapper delegate via `__getattr__`, so chained attribute
-        access works through the wrapper.
+        UBatchWrapper delegate via `__getattr__`.
 
         TP-safe: decoder layer outputs are post-allreduce, so all ranks
         observe the same unsharded tensor. Only the driver's
@@ -5500,31 +5503,30 @@ class GPUModelRunner(
                 f"{len(layers) - 1}])."
             )
         layer_idx = len(layers) - 1 - N
-        target_layer = layers[layer_idx]
 
-        def _hook(_module, _inputs, output):
-            # Decoder block usually returns either a tensor or a tuple
-            # whose first element is the hidden states.
-            hs = output[0] if isinstance(output, tuple) else output
-            if not torch.is_tensor(hs):
-                return
-            # Detach (we don't need autograd) and stash. Slicing +
-            # CPU copy happens after the full forward returns, in
-            # execute_model's post-forward block.
-            self._captured_hidden_states_buf = hs.detach()
-
-        if self._extract_hidden_states_hook is not None:
-            self._extract_hidden_states_hook.remove()
-        self._extract_hidden_states_hook = target_layer.register_forward_hook(
-            _hook
+        # Allocate a fixed buffer sized [max_num_batched_tokens, hidden_dim]
+        # on rank-0 cuda:0. The model writes at most num_scheduled_tokens
+        # rows per step; we slice `[:num_scheduled_tokens]` post-forward.
+        hidden_dim = self.model_config.get_hidden_size()
+        max_tokens = self.scheduler_config.max_num_batched_tokens
+        self._captured_hidden_states_buf = torch.zeros(
+            (max_tokens, hidden_dim),
+            dtype=self.dtype,
+            device="cuda:0",
         )
+        # Stash on the LLM body module so its forward can read these
+        # attributes without needing a forward_context schema change.
+        body._paper_explore_extract_buf = self._captured_hidden_states_buf
+        body._paper_explore_extract_layer_idx = layer_idx
+
         logger.info(
-            "Installed extract_hidden_states forward hook on decoder "
-            "layer %d-from-end (idx=%d of %d). Per-request opt-in via "
-            "SamplingParams.extract_hidden_states.",
+            "Installed extract_hidden_states inline capture on decoder "
+            "layer %d-from-end (idx=%d of %d), buf shape=%s. "
+            "Per-request opt-in via SamplingParams.extract_hidden_states.",
             N,
             layer_idx,
             len(layers),
+            tuple(self._captured_hidden_states_buf.shape),
         )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
