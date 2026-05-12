@@ -235,6 +235,18 @@ class InputBatch:
 
         self.num_logprobs: dict[str, int] = {}
 
+        # paper_explore SYS1: requests that asked for hidden-state extraction
+        # via SamplingParams.extract_hidden_states=True. Only meaningful when
+        # the worker has VLLM_EXTRACT_HIDDEN_STATES_LAYER set.
+        self.extract_hidden_states_reqs: set[str] = set()
+
+        # paper_explore SYS1 head-cascade: requests with
+        # SamplingParams.head_cascade=True. Cleared on remove_request.
+        # (No SHIP_BOUND tracking — under the simplified always-dispatch-
+        # target-ViT design, the cut-0 score is just stashed and the
+        # OR-skip decision is evaluated at cut-1 in gpu_model_runner.)
+        self.head_cascade_reqs: set[str] = set()
+
         # To accumulate prompt logprobs tensor chunks across prefill steps.
         self.in_progress_prompt_logprobs_cpu: dict[str, LogprobsTensors] = {}
 
@@ -395,6 +407,34 @@ class InputBatch:
                     else sampling_params.logprobs
                 )
 
+            if sampling_params.extract_hidden_states:
+                # NOTE: previously this branch also fired when
+                # `sampling_params.head_cascade` was True, on the
+                # theory that "head_cascade implies extract". That
+                # was wrong: the cascade head runs INLINE inside
+                # Qwen2Model.forward and reads hidden_states directly
+                # from the layer's output. The extract path
+                # (populating hidden_states_dict via a GPU→CPU
+                # synchronous copy in execute_model) is only needed
+                # for the user-facing RequestOutput.hidden_states,
+                # which cascade-only requests don't consume.
+                # Auto-enabling extract for head_cascade reqs caused
+                # ~10% throughput regression on long-output VLM
+                # workloads (forced per-step D→H sync stalled the
+                # decode pipeline). Phase 3's numerical-match
+                # validation still works because `sys2_capture_hidden_states.py`
+                # sets extract_hidden_states=True explicitly.
+                self.extract_hidden_states_reqs.add(req_id)
+
+            if sampling_params.head_cascade:
+                self.head_cascade_reqs.add(req_id)
+                import os as _os
+                if _os.environ.get("VLLM_HEAD_CASCADE_LOG_SCORES"):
+                    print(
+                        f"[head-cascade] add_request rid={req_id} "
+                        f"max_tokens={sampling_params.max_tokens}", flush=True,
+                    )
+
             if sampling_params.allowed_token_ids:
                 self.has_allowed_token_ids.add(req_id)
                 if self.allowed_token_ids_mask_cpu_tensor is None:
@@ -522,6 +562,8 @@ class InputBatch:
         self.repetition_penalties_reqs.discard(req_id)
         self.generators.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
+        self.extract_hidden_states_reqs.discard(req_id)
+        self.head_cascade_reqs.discard(req_id)
         self.in_progress_prompt_logprobs_cpu.pop(req_id, None)
         if self.prev_req_id_to_index is not None:
             self.prev_req_id_to_index.pop(req_id, None)

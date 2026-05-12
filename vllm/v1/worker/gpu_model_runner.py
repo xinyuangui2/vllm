@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -286,6 +287,183 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         return output
 
 
+class _FusedMoEHead(torch.nn.Module):
+    """Graph-capture-friendly drop-in for paper_explore's MoEHead.
+
+    Two problems with the original `MoEHead` under CUDA graph
+    capture:
+      1. `torch.cat([e(x) for e in self.experts], dim=-1)` —
+         list comp over `nn.ModuleList` is unrolled by Inductor
+         into K per-expert subgraphs plus a cat that allocates
+         `empty_strided_cuda` mid-capture.
+      2. The expected input is `cat([hidden_states, pos_col], -1)`
+         where `pos_col ∈ {0, 1}`. The outer `torch.cat` ALSO
+         materializes hidden_states (often a non-contig view of
+         the fused-norm output) into a fresh `empty_strided_cuda`
+         buffer, which is the actual error trace we saw.
+
+    This fused form fixes BOTH:
+      • Per-expert matmuls collapse into a single einsum.
+      • The pos column is absorbed into per-expert biases. The
+        head's forward takes raw hidden_states (no cat needed)
+        and exposes `forward_pos0` / `forward_pos1` methods.
+
+    Math (in_dim D=hidden_dim+1, hidden H, n_experts E,
+          input x has the LAST column pos ∈ {0, 1}):
+
+      first_layer(cat([h, pos])) = W[:, :D-1] @ h + W[:, D-1:] * pos + b
+                                 = W_h @ h + (W_p * pos) + b
+
+    For pos=0: bias = b
+    For pos=1: bias = b + W_p.squeeze(-1)
+
+    So we keep W_h (without the pos column) and pre-bake two
+    biases: b_pos0 = b, b_pos1 = b + W_p.squeeze(-1). The rest
+    of the head (LeakyReLU, second linear) sees no change.
+
+    Shapes (hidden_dim Dh, gate hidden 64, expert hidden H,
+            n_experts E):
+      gate_W_h:     [64, Dh]    (gate first Linear weight without pos col)
+      gate_b_pos0: [64]         (gate first Linear bias)
+      gate_b_pos1: [64]         (gate_b_pos0 + W_p_col)
+      gate_W2:     [E, 64]      (gate second Linear weight)
+      gate_b2:     [E]          (gate second Linear bias)
+      W1_h:        [E, H, Dh]   (expert first Linear weight without pos col)
+      b1_pos0:     [E, H]
+      b1_pos1:     [E, H]
+      W2:          [E, 1, H]    (expert second Linear weight)
+      b2:          [E, 1]
+
+    Forward returns `(logit_unsqueezed, gate_softmax)` to match
+    the original two-tensor return that qwen2.Qwen2Model.forward
+    unpacks as `(score_logits, src_logits)`.
+    """
+
+    def __init__(self,
+                 n_experts: int,
+                 gate_W_h: torch.Tensor, gate_b_pos0: torch.Tensor,
+                 gate_b_pos1: torch.Tensor,
+                 gate_W2: torch.Tensor, gate_b2: torch.Tensor,
+                 W1_h: torch.Tensor, b1_pos0: torch.Tensor,
+                 b1_pos1: torch.Tensor,
+                 W2: torch.Tensor, b2: torch.Tensor):
+        super().__init__()
+        self.n_experts = n_experts
+        P = torch.nn.Parameter
+        self.gate_W_h    = P(gate_W_h,    requires_grad=False)
+        self.gate_b_pos0 = P(gate_b_pos0, requires_grad=False)
+        self.gate_b_pos1 = P(gate_b_pos1, requires_grad=False)
+        self.gate_W2     = P(gate_W2,     requires_grad=False)
+        self.gate_b2     = P(gate_b2,     requires_grad=False)
+        self.W1_h    = P(W1_h,    requires_grad=False)
+        self.b1_pos0 = P(b1_pos0, requires_grad=False)
+        self.b1_pos1 = P(b1_pos1, requires_grad=False)
+        self.W2  = P(W2,  requires_grad=False)
+        self.b2  = P(b2,  requires_grad=False)
+
+    def _impl(self, x: torch.Tensor,
+              gate_b_pos: torch.Tensor, b1_pos: torch.Tensor):
+        # x: [B, Dh] — raw hidden_states, no pos column
+        gate_h = torch.nn.functional.linear(x, self.gate_W_h, gate_b_pos)
+        gate_h = torch.nn.functional.leaky_relu(gate_h, 0.01)
+        gate_logits = torch.nn.functional.linear(gate_h, self.gate_W2, self.gate_b2)
+        gate = torch.softmax(gate_logits, dim=-1)             # [B, E]
+        # All experts in parallel: [E, H, Dh] @ [B, Dh] -> [B, E, H]
+        h = torch.einsum("ehd,bd->beh", self.W1_h, x) + b1_pos.unsqueeze(0)
+        h = torch.nn.functional.leaky_relu(h, 0.01)
+        # Per-expert scalar: [E, 1, H] @ [B, E, H] -> [B, E, 1]
+        o = torch.einsum("eod,bed->beo", self.W2, h) + self.b2.unsqueeze(0)
+        out = o.squeeze(-1)                                    # [B, E]
+        logit = (gate * out).sum(dim=-1, keepdim=True)         # [B, 1]
+        return logit, gate
+
+    def forward_pos0(self, x: torch.Tensor):
+        return self._impl(x, self.gate_b_pos0, self.b1_pos0)
+
+    def forward_pos1(self, x: torch.Tensor):
+        return self._impl(x, self.gate_b_pos1, self.b1_pos1)
+
+    # Backward-compatible: if someone passes the original
+    # cat([h, pos]) input, split off the pos column and route.
+    def forward(self, x: torch.Tensor):
+        # If x has the original 3585 cols, the LAST col is pos.
+        # Detect by shape: gate_W_h.shape[1] is the no-pos input dim.
+        if x.shape[-1] == self.gate_W_h.shape[1] + 1:
+            pos = x[..., -1:]
+            x_h = x[..., :-1]
+            # Two passes — caller should prefer forward_pos0/1.
+            return self._impl(
+                x_h,
+                self.gate_b_pos0 if (pos.sum() == 0) else self.gate_b_pos1,
+                self.b1_pos0     if (pos.sum() == 0) else self.b1_pos1,
+            )
+        # Otherwise assume pos=0 (default behavior).
+        return self.forward_pos0(x)
+
+
+def _repack_moe_head_for_graph_capture(model: torch.nn.Module) -> torch.nn.Module:
+    """Take a paper_explore `MoEHead` instance (already loaded with
+    state_dict on CPU) and return a `_FusedMoEHead` with the same
+    learned weights, suitable for CUDA graph capture.
+
+    Also splits the pos column out of all first-layer Linear weights
+    and pre-bakes pos=0 / pos=1 biases so the head can be called
+    with raw hidden_states (no `torch.cat`)."""
+    if not hasattr(model, "experts") or not hasattr(model, "gate"):
+        raise RuntimeError(
+            f"_repack_moe_head_for_graph_capture: expected a paper_explore "
+            f"MoEHead with .gate and .experts, got {type(model).__name__}"
+        )
+    # paper_explore MoEHead's gate: Sequential(Linear(D, 64), LeakyReLU, Linear(64, E)).
+    # paper_explore MoEHead's experts[k]: Sequential(Linear(D, H), LeakyReLU,
+    #   Dropout|Identity, Linear(H, 1)).
+    # D = hidden_dim + pos_dim (typically 3584 + 1 = 3585). The last input
+    # column corresponds to pos ∈ {0, 1}.
+
+    # ---- gate ----
+    g_first  = model.gate[0]                # Linear(D, 64)
+    g_second = model.gate[-1]               # Linear(64, E)
+    D = g_first.weight.shape[1]             # 3585
+    gate_W_h    = g_first.weight.data[:, :-1].clone()  # [64, D-1]
+    gate_W_p    = g_first.weight.data[:, -1].clone()   # [64]
+    gate_b_pos0 = g_first.bias.data.clone()            # [64]
+    gate_b_pos1 = (gate_b_pos0 + gate_W_p).clone()     # [64]
+    gate_W2 = g_second.weight.data.clone()  # [E, 64]
+    gate_b2 = g_second.bias.data.clone()    # [E]
+
+    # ---- experts ----
+    experts = model.experts
+    n_experts = len(experts)
+    # First Linear per expert: weight [H, D], bias [H].
+    W1_h_list, b1_pos0_list, b1_pos1_list = [], [], []
+    for e in experts:
+        first = e[0]
+        last  = e[-1]
+        assert first.weight.shape[1] == D, (
+            f"expert first-Linear in_features={first.weight.shape[1]} "
+            f"does not match gate in_features={D}"
+        )
+        W_h = first.weight.data[:, :-1].clone()  # [H, D-1]
+        W_p = first.weight.data[:, -1].clone()   # [H]
+        b   = first.bias.data.clone()            # [H]
+        W1_h_list.append(W_h)
+        b1_pos0_list.append(b)
+        b1_pos1_list.append(b + W_p)
+    W1_h    = torch.stack(W1_h_list,    dim=0)  # [E, H, D-1]
+    b1_pos0 = torch.stack(b1_pos0_list, dim=0)  # [E, H]
+    b1_pos1 = torch.stack(b1_pos1_list, dim=0)  # [E, H]
+    # Second Linear per expert: weight [1, H], bias [1].
+    W2 = torch.stack([e[-1].weight.data for e in experts], dim=0)  # [E, 1, H]
+    b2 = torch.stack([e[-1].bias.data   for e in experts], dim=0)  # [E, 1]
+
+    return _FusedMoEHead(
+        n_experts,
+        gate_W_h, gate_b_pos0, gate_b_pos1, gate_W2, gate_b2,
+        W1_h, b1_pos0, b1_pos1,
+        W2, b2,
+    )
+
+
 def _copy_pooler_output_to_cpu(
     raw_pooler_output: PoolerOutput, finished_mask: list[bool]
 ) -> list[torch.Tensor | None]:
@@ -488,6 +666,76 @@ class GPUModelRunner(
 
         # Lazy initializations
         # self.model: nn.Module  # Set after load_model
+        # paper_explore SYS1: hidden-state extraction. Reads N from
+        # VLLM_EXTRACT_HIDDEN_STATES_LAYER (None disables); installs a
+        # post-forward hook on the Nth-from-end decoder layer in
+        # load_model(). Per-request opt-in via
+        # SamplingParams.extract_hidden_states.
+        _hsl_env = os.environ.get("VLLM_EXTRACT_HIDDEN_STATES_LAYER")
+        self._extract_hidden_states_layer: int | None = (
+            int(_hsl_env) if _hsl_env not in (None, "") else None
+        )
+        # paper_explore SYS1: persistent buffer holding the targeted
+        # decoder layer's hidden states. Written inline by the model's
+        # forward (see Qwen2Model.forward), read post-forward in
+        # execute_model. Allocated once in _install_extract_hidden_states_buf
+        # at engine init, reused across steps — CUDA-graph-safe.
+        self._captured_hidden_states_buf: torch.Tensor | None = None
+
+        # paper_explore SYS1 head-cascade. Loaded in load_model() when
+        # the env vars are set. Inputs:
+        #   VLLM_HEAD_CHECKPOINT_PATH       — path to head .pt file
+        #   VLLM_HEAD_TAU_TABLE_PATH        — path to per-source τ JSON
+        #                                     (e.g. cascade_per_source_tau_p_0.98.json)
+        #   VLLM_PAPER_EXPLORE_PATH         — added to sys.path so the
+        #                                     head builder + target-ViT
+        #                                     encoder modules can be imported
+        #   VLLM_TARGET_VISION_MODEL_ID     — HF id whose .visual is loaded
+        #                                     on rank-0 cuda:0 for the
+        #                                     standalone target-ViT encoder
+        self._head_ckpt_path: str | None = os.environ.get(
+            "VLLM_HEAD_CHECKPOINT_PATH"
+        ) or None
+        self._head_tau_path: str | None = os.environ.get(
+            "VLLM_HEAD_TAU_TABLE_PATH"
+        ) or None
+        self._paper_explore_path: str | None = os.environ.get(
+            "VLLM_PAPER_EXPLORE_PATH"
+        ) or None
+        self._target_vision_model_id: str | None = os.environ.get(
+            "VLLM_TARGET_VISION_MODEL_ID"
+        ) or None
+        # Lazy-loaded by load_model()
+        self._head_model = None
+        self._head_forward = None
+        self._head_temperature: float = 1.0
+        # Per-source τ tables: source_name -> (τ_L1, τ_L2). For a
+        # request with predicted source `s`, threshold τ_L1[s] at cut
+        # 0.0 and τ_L2[s] at cut 1.0.
+        self._tau_table: dict[str, tuple[float, float]] | None = None
+        # Source vocabulary in head order — used to map argmax(gate)
+        # index back to source name.
+        self._head_source_vocab: list[str] | None = None
+        # Standalone target-ViT encoder (rank-0 only).
+        self._target_vision = None
+        # Per-step set of in-flight target-ViT batches. Each entry holds
+        # a TargetVitBatch (with concat'd embeds + event + offsets).
+        self._target_vit_batches: list = []
+        self._req_to_target_vit_batch: dict[str, int] = {}
+        # EOS token ids for cut-1 detection — populated post-load.
+        self._head_eos_token_ids: set[int] = set()
+        # paper_explore SYS1 cascade: handles to the score / src buffers
+        # the model writes during forward. Set by _load_cascade_head().
+        # None when no cascade is configured.
+        self._cascade_score0_buf: torch.Tensor | None = None
+        self._cascade_score1_buf: torch.Tensor | None = None
+        self._cascade_src_buf: torch.Tensor | None = None
+        # Per-req cut-0 stash: at the first decode step we record the
+        # cut-0 score + predicted source; at cut-1 we pop and combine
+        # with the cut-1 score for the OR-skip decision.
+        self._stashed_score0: dict[str, float] = {}
+        self._stashed_src: dict[str, int] = {}
+
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
         # Initialize in initialize_kv_cache_tensors
@@ -3859,6 +4107,10 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            # paper_explore SYS1 head-cascade reads these in sample_tokens;
+            # ExecuteModelState was kept untouched to avoid wider ripples.
+            self._paper_explore_logits_indices = logits_indices
+            self._paper_explore_num_tokens_unpadded = num_tokens_unpadded
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -3884,6 +4136,12 @@ class GPUModelRunner(
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
+
+            # paper_explore SYS1: the inline extract-hidden-states capture
+            # writes to a persistent buffer, which IS CUDA-graph-safe.
+            # No cudagraph_mode override needed (this used to force NONE
+            # under the forward-hook design — removed when we moved to
+            # inline capture in Qwen2Model.forward).
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -4038,6 +4296,76 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+
+        # paper_explore SYS1: read per-request last-token hidden state
+        # from the persistent inline-capture buffer. The model's forward
+        # wrote rows [0..num_scheduled_tokens) of this buffer at the
+        # configured decoder layer (see Qwen2Model.forward). We slice
+        # with logits_indices (same per-request last-position map vLLM
+        # uses for sample_hidden_states) and ship a CPU tensor per req
+        # in hidden_states_dict.
+        hidden_states_dict: dict[str, torch.Tensor | None] = {}
+        extract_reqs = (
+            self.input_batch.extract_hidden_states_reqs
+            if self._extract_hidden_states_layer is not None
+            else set()
+        )
+        if extract_reqs and self._captured_hidden_states_buf is not None:
+            # Only the first num_scheduled_tokens rows were written this
+            # step. logits_indices indexes into that range.
+            captured = self._captured_hidden_states_buf[:num_tokens_unpadded]
+            try:
+                # `logits_indices` is sometimes on a different device than
+                # `captured` (CPU in some code paths, a different
+                # cuda:N alias in others). Force it onto the captured
+                # tensor's device before indexing — without this, the
+                # `captured[logits_indices]` raises a device-mismatch
+                # error which the outer try/except silently swallows,
+                # leaving hidden_states_dict empty for that step.
+                # Caught during Phase 4 of the SYS2 smoke: every step
+                # was failing this path on ~3-4k warnings per cell.
+                li = logits_indices
+                if (
+                    isinstance(li, torch.Tensor)
+                    and li.device != captured.device
+                ):
+                    li = li.to(captured.device)
+                # `non_blocking=False` on the GPU→CPU copy is load-bearing.
+                # The capture diagnostic in Phase 3 of the SYS2 smoke showed
+                # that with non_blocking=True, the FIRST yield's
+                # RequestOutput.hidden_states is a zero tensor for all but
+                # the last submitted request: the async D→H memcpy hadn't
+                # landed before the `.contiguous().clone()` below read the
+                # CPU buffer, so the clone captured uninitialized memory
+                # (zeros). Cost of forcing the sync: ~50-200 µs per step,
+                # well below the noise floor of the per-step decode wall.
+                last_token_hs = captured[li].to(
+                    "cpu", non_blocking=False
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.warning(
+                    "extract_hidden_states: failed to slice captured "
+                    "tensor with logits_indices (shape %s, idx len %s): %s",
+                    tuple(captured.shape),
+                    int(logits_indices.numel()) if logits_indices is not None else 0,
+                    e,
+                )
+                last_token_hs = None
+            if last_token_hs is not None:
+                req_ids_for_capture = self.input_batch.req_ids
+                # Spec decode can produce more logits than reqs; skip in
+                # that case. Draft engines (no spec decode) hit the
+                # equality path.
+                if last_token_hs.size(0) == len(req_ids_for_capture):
+                    for i, rid in enumerate(req_ids_for_capture):
+                        if rid is not None and rid in extract_reqs:
+                            hidden_states_dict[rid] = (
+                                last_token_hs[i].contiguous().clone()
+                            )
+        # paper_explore SYS1: stash for sample_tokens which builds the
+        # ModelRunnerOutput. execute_model_state intentionally left
+        # untouched.
+        self._paper_explore_hidden_states_dict = hidden_states_dict
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4306,6 +4634,20 @@ class GPUModelRunner(
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
+        # paper_explore SYS1 head-cascade: the head already ran INSIDE
+        # Qwen2Model.forward at the targeted layer (scores in the
+        # model's pre-allocated buffers). Here we just detect boundary
+        # requests (cut 0.0 / cut 1.0), apply the OR-skip rule using
+        # stashed cut-0 scores + this step's cut-1 scores, and dispatch
+        # target-ViT for cut-0 reqs (always, no head-gating).
+        cascade_decisions_dict, target_vit_payloads_dict = (
+            self._run_head_cascade_step(
+                valid_sampled_token_ids,
+                self._paper_explore_logits_indices,
+                self._paper_explore_num_tokens_unpadded,
+            )
+        )
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -4320,6 +4662,9 @@ class GPUModelRunner(
                 sampled_token_ids=valid_sampled_token_ids,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
+                hidden_states_dict=self._paper_explore_hidden_states_dict,
+                cascade_decisions_dict=cascade_decisions_dict,
+                target_vit_payloads_dict=target_vit_payloads_dict,
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output
                 if self.supports_mm_inputs
@@ -4884,7 +5229,636 @@ class GPUModelRunner(
                     self.model, self.vllm_config, CUDAGraphMode.NONE, self.device
                 )
 
+        # paper_explore SYS1: allocate a persistent extract buffer and
+        # stash it on the LLM body so model.forward writes inline at
+        # the targeted layer. CUDA-graph-safe (no Python hook, no
+        # cudagraph_mode override required).
+        self._install_extract_hidden_states_buf()
+
+        # paper_explore SYS1 head-cascade: load the head + per-source τ
+        # table once at engine init, and the standalone target-ViT
+        # encoder if configured. All on rank-0 cuda:0 (only the driver
+        # rank produces ModelRunnerOutput, so non-driver ranks don't
+        # need these). Safe to call regardless of TP/PP setup.
+        self._load_cascade_head()
+        self._load_target_vision_encoder()
+
         get_offloader().post_init()
+
+    def _maybe_add_paper_explore_to_path(self) -> None:
+        """Add VLLM_PAPER_EXPLORE_PATH to sys.path so the head builder
+        + target-ViT modules can be imported from the paper_explore repo."""
+        import sys
+        if self._paper_explore_path and self._paper_explore_path not in sys.path:
+            sys.path.insert(0, self._paper_explore_path)
+
+    def _load_cascade_head(self) -> None:
+        """Load the trained head + per-source τ table on rank-0 cuda:0.
+        Skips silently if env vars not set (no-op for non-cascade runs)."""
+        if not (self._head_ckpt_path and self._head_tau_path):
+            return
+        if not get_pp_group().is_last_rank:
+            return
+        # Only rank 0 of TP holds the head — non-driver TP ranks don't
+        # build ModelRunnerOutput so they have no use for it.
+        from vllm.distributed import get_tp_group
+        if get_tp_group().rank_in_group != 0:
+            return
+
+        self._maybe_add_paper_explore_to_path()
+        # Re-use the existing builder in paper_explore. Falls back to a
+        # clear error if the script isn't on sys.path — caller forgot to
+        # set VLLM_PAPER_EXPLORE_PATH.
+        try:
+            from scripts.eval_classifier_head import (
+                build_model_from_ckpt,
+                _forward_logits,
+            )
+        except ImportError as e:
+            raise RuntimeError(
+                "VLLM_HEAD_CHECKPOINT_PATH is set but paper_explore's "
+                "scripts.eval_classifier_head is not importable. Set "
+                "VLLM_PAPER_EXPLORE_PATH=/path/to/paper_explore. "
+                f"Underlying: {e}"
+            )
+
+        ckpt = torch.load(
+            self._head_ckpt_path, map_location="cpu", weights_only=False,
+        )
+        cargs = ckpt["args"]
+        in_dim = int(cargs["hidden_dim"]) + int(cargs["pos_dim"])
+        domain_vocab = ckpt.get("domain_vocab", ["chat"])
+        n_domains = len(domain_vocab)
+        model, fwd = build_model_from_ckpt(ckpt, in_dim, n_domains)
+        model.load_state_dict(ckpt["state_dict"])
+        # For the MoE head, repack per-expert Linear weights into
+        # stacked 3-D tensors so the forward fuses into a single
+        # einsum. The original implementation does
+        # `torch.cat([e(x) for e in self.experts], dim=-1)` which
+        # Inductor lowers to `empty_strided_cuda` mid-graph and
+        # breaks CUDA graph capture.
+        arch = cargs.get("architecture", "mlp")
+        if arch == "moe":
+            model = _repack_moe_head_for_graph_capture(model)
+        # Cast to engine dtype so the head's matmuls match the
+        # decoder layer's hidden_states (bfloat16 in our setup).
+        model = model.to("cuda:0", dtype=self.dtype).eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
+        self._head_model = model
+        self._head_forward = fwd
+        self._head_temperature = float(ckpt.get("temperature", 1.0))
+
+        # τ table: cascade_per_source_tau JSON has per_source[src] →
+        # {tau_l1, tau_l2}. Plus a global cell at top level.
+        import json
+        with open(self._head_tau_path) as f:
+            tau_raw = json.load(f)
+        per_source = tau_raw.get("per_source", {})
+        self._tau_table = {
+            src: (float(v["tau_l1"]), float(v["tau_l2"]))
+            for src, v in per_source.items()
+        }
+        # Also stash the global cell as a fallback for heads that don't
+        # produce source predictions (e.g., the unified MLP) or for
+        # OOD sources not in per_source.
+        g = tau_raw.get("global", {})
+        if g:
+            self._tau_table["global"] = (
+                float(g.get("tau_l1", 0.5)),
+                float(g.get("tau_l2", 0.5)),
+            )
+        # Source vocab in head order; argmax(source_logits) returns the
+        # index, we map back via this list. The source_head training
+        # script stashes this in the checkpoint as "source_vocab".
+        # Fall back to sorted keys of the τ table if absent.
+        self._head_source_vocab = ckpt.get(
+            "source_vocab", sorted(self._tau_table.keys()),
+        )
+
+        # EOS ids for cut-1 detection. Pull from the tokenizer.
+        try:
+            tokenizer = self.model_config.tokenizer
+            if isinstance(tokenizer, str):
+                from transformers import AutoTokenizer
+                tokenizer = AutoTokenizer.from_pretrained(
+                    tokenizer, trust_remote_code=True,
+                )
+            eos = tokenizer.eos_token_id
+            if isinstance(eos, int):
+                self._head_eos_token_ids = {eos}
+            elif eos is not None:
+                self._head_eos_token_ids = set(eos)
+        except Exception:
+            # If the tokenizer can't be loaded here, fall back to whatever
+            # SamplingParams.stop_token_ids the user passes per request.
+            pass
+
+        # Install head + score / src / pos buffers on the LLM body so
+        # the head runs INSIDE Qwen2Model.forward at the targeted layer
+        # (CUDA-graph-captured). The engine reads from these buffers
+        # post-forward via logits_indices instead of running the head
+        # itself.
+        body = self._resolve_llm_body()
+        max_tokens = self.scheduler_config.max_num_batched_tokens
+        device = torch.device("cuda:0")
+        # Pos columns in the same dtype as the hidden states so cat
+        # without upcast.
+        body._paper_explore_head = model
+        body._paper_explore_head_forward = fwd
+        body._paper_explore_head_temperature = self._head_temperature
+        body._pos0_col = torch.zeros(
+            (max_tokens, 1), dtype=self.dtype, device=device,
+        )
+        body._pos1_col = torch.ones(
+            (max_tokens, 1), dtype=self.dtype, device=device,
+        )
+        # Scores are post-sigmoid in [0, 1]; keep them in float32 for
+        # decision comparisons against τ (also float32).
+        body._score0_buf = torch.zeros(
+            max_tokens, dtype=torch.float32, device=device,
+        )
+        body._score1_buf = torch.zeros(
+            max_tokens, dtype=torch.float32, device=device,
+        )
+        body._src_buf = torch.zeros(
+            max_tokens, dtype=torch.long, device=device,
+        )
+        # Stash engine-side handles for fast access in execute_model.
+        self._cascade_score0_buf = body._score0_buf
+        self._cascade_score1_buf = body._score1_buf
+        self._cascade_src_buf = body._src_buf
+
+        logger.info(
+            "Loaded head-cascade head from %s (in_dim=%d, n_domains=%d, "
+            "tau_table=%d sources, eos_ids=%s) — head runs inline "
+            "inside Qwen2Model.forward; graph-captured.",
+            self._head_ckpt_path, in_dim, n_domains,
+            len(self._tau_table), self._head_eos_token_ids,
+        )
+
+    def _resolve_llm_body(self):
+        """Walk through CUDAGraphWrapper / VL wrapper attributes to the
+        LLM body (the Qwen2Model holding the decoder ModuleList)."""
+        base = self.model
+        if hasattr(base, "language_model"):
+            lm = base.language_model
+            if hasattr(lm, "model") and hasattr(lm.model, "layers"):
+                return lm.model
+        if hasattr(base, "model") and hasattr(base.model, "layers"):
+            return base.model
+        raise RuntimeError(
+            "Could not locate decoder body. Expected "
+            "model.language_model.model.layers or model.model.layers. "
+            f"Type={type(self.model).__name__}."
+        )
+
+    def _load_target_vision_encoder(self) -> None:
+        """Load the standalone target-ViT (Qwen2.5-VL .visual subset) on
+        rank-0 cuda:0. Skips silently if env var not set."""
+        if not self._target_vision_model_id:
+            return
+        if not get_pp_group().is_last_rank:
+            return
+        from vllm.distributed import get_tp_group
+        if get_tp_group().rank_in_group != 0:
+            return
+
+        self._maybe_add_paper_explore_to_path()
+        try:
+            from glue.target_vision import TargetVisionEncoder
+        except ImportError as e:
+            raise RuntimeError(
+                "VLLM_TARGET_VISION_MODEL_ID is set but paper_explore's "
+                "glue.target_vision is not importable. Set "
+                "VLLM_PAPER_EXPLORE_PATH=/path/to/paper_explore. "
+                f"Underlying: {e}"
+            )
+        self._target_vision = TargetVisionEncoder(
+            target_model_id=self._target_vision_model_id,
+            device="cuda:0",
+            dtype=torch.bfloat16,
+        )
+        logger.info(
+            "Loaded standalone target-ViT for head-cascade offload: %s",
+            self._target_vision_model_id,
+        )
+
+    # ------------------------------------------------------------------
+    # paper_explore SYS1 head-cascade helpers (rank-0 only)
+    # ------------------------------------------------------------------
+
+    def _is_cut0_for_req(
+        self,
+        req_id: str,
+        sampled_token_ids_for_req: list[int],
+    ) -> bool:
+        """Cut 0.0 fires on the step where the request first emits a
+        token, i.e. immediately after prefill finishes.
+
+        NOTE: `_run_head_cascade_step` runs AFTER
+        `_update_states_after_model_execute` has extended
+        `req.output_token_ids` with the just-sampled tokens. So
+        "no tokens before this step" means output_token_ids consists
+        ENTIRELY of what we just sampled."""
+        req = self.requests.get(req_id)
+        if req is None or not sampled_token_ids_for_req:
+            return False
+        n_sampled = len(sampled_token_ids_for_req)
+        return (
+            len(req.output_token_ids) == n_sampled
+            and n_sampled > 0
+        )
+
+    def _is_cut1_for_req(
+        self,
+        req_id: str,
+        sampled_token_ids_for_req: list[int],
+    ) -> bool:
+        """Cut 1.0 fires on the step where this request emits EOS or
+        will hit max_tokens. The actual finish-reason determination
+        happens in scheduler.update_from_output AFTER this; we
+        anticipate it by inspecting the just-sampled tokens here.
+
+        NOTE: like _is_cut0_for_req, this runs AFTER
+        `_update_states_after_model_execute` has extended
+        `req.output_token_ids`; the just-sampled tokens are already
+        included in the count."""
+        req = self.requests.get(req_id)
+        if req is None or not sampled_token_ids_for_req:
+            return False
+        # EOS-style finish: any newly sampled token is in the eos set.
+        # Also honor per-request stop_token_ids from sampling_params.
+        eos_ids = set(self._head_eos_token_ids)
+        sp = req.sampling_params
+        if sp is not None and sp.stop_token_ids:
+            eos_ids.update(sp.stop_token_ids)
+        if any(tok in eos_ids for tok in sampled_token_ids_for_req):
+            return True
+        # Length-style finish. output_token_ids already includes the
+        # just-sampled tokens (extend happened before us).
+        new_total = len(req.output_token_ids)
+        max_tokens = sp.max_tokens if sp is not None else None
+        if max_tokens is not None and new_total >= max_tokens:
+            return True
+        return False
+
+    def _gather_mm_features_for_req(self, req_id: str):
+        """Pull pre-processed (pixel_values, image_grid_thw) for a single
+        request from CachedRequestState. Returns None if the request
+        has no multi-modal features (text-only)."""
+        req = self.requests.get(req_id)
+        if os.environ.get("VLLM_HEAD_CASCADE_LOG_SCORES"):
+            mmf_summary = (
+                f"n_mm_features={len(req.mm_features) if req and req.mm_features else 0}"
+                if req is not None else "req=None"
+            )
+            if req is not None and req.mm_features:
+                mmf_summary += f" mmf0_attrs={sorted(a for a in dir(req.mm_features[0]) if not a.startswith('_'))[:10]}"
+            print(f"[head-cascade] gather_mm rid={req_id} {mmf_summary}", flush=True)
+        if req is None or not req.mm_features:
+            return None
+        # Use the first image's features. Multi-image requests would
+        # need a join across all mm_features rows; defer that to
+        # follow-up — our 5 VLM benchmarks are single-image.
+        # vLLM v1's MultiModalFeature has the pre-processed tensors
+        # nested inside `mmf.data` (a MultiModalKwargs dict). Each
+        # field's value is a `MultiModalFieldElem` whose `.data` is
+        # the raw tensor.
+        def _unwrap(v):
+            if v is None or isinstance(v, torch.Tensor):
+                return v
+            inner = getattr(v, "data", None)
+            return inner if isinstance(inner, torch.Tensor) else None
+
+        pv_chunks, thw_chunks = [], []
+        for mmf in req.mm_features:
+            pv = getattr(mmf, "pixel_values", None)
+            thw = getattr(mmf, "image_grid_thw", None)
+            if pv is None or thw is None:
+                data = getattr(mmf, "data", None)
+                if data is not None:
+                    pv = pv if pv is not None else _unwrap(data.get("pixel_values"))
+                    thw = thw if thw is not None else _unwrap(data.get("image_grid_thw"))
+            if pv is None or thw is None:
+                if os.environ.get("VLLM_HEAD_CASCADE_LOG_SCORES"):
+                    keys = (
+                        list(getattr(mmf, "data", {}).keys())
+                        if hasattr(mmf, "data") else "no .data"
+                    )
+                    print(
+                        f"[head-cascade] gather_mm rid={req_id} miss: "
+                        f"pv={pv is not None} thw={thw is not None} "
+                        f"data_keys={keys}", flush=True,
+                    )
+                continue
+            # image_grid_thw is sometimes stored as a 1D [3] tensor
+            # (per-image) and sometimes as [N, 3]. Target-ViT expects
+            # 2D rows; normalize here.
+            if thw.dim() == 1:
+                thw = thw.unsqueeze(0)
+            pv_chunks.append(pv)
+            thw_chunks.append(thw)
+        if not pv_chunks:
+            return None
+        if len(pv_chunks) == 1:
+            return pv_chunks[0], thw_chunks[0]
+        return (
+            torch.cat(pv_chunks, dim=0),
+            torch.cat(thw_chunks, dim=0),
+        )
+
+    def _run_head_cascade_step(
+        self,
+        valid_sampled_token_ids: list[list[int]],
+        logits_indices: torch.Tensor,
+        num_tokens_unpadded: int,
+    ) -> tuple[dict[str, str], dict[str, tuple[torch.Tensor, torch.Tensor]]]:
+        """Per-request decisions for cascade-enabled requests.
+
+        The model already ran the head INSIDE Qwen2Model.forward at
+        the targeted layer over all positions, at both pos_frac=0.0
+        and pos_frac=1.0. Score tensors live at
+        body._score0_buf / _score1_buf / _src_buf (handles on self).
+        This step just reads them via logits_indices and applies the
+        OR-skip rule using per-req boundary detection.
+
+        Engine policy:
+          - At cut 0.0 (first decode step): stash score_at_pos0 +
+            predicted source. Head-gate the target-ViT dispatch — if
+            s00 ≥ τ_L1[src] (the cut-0 OR-skip arm already passes),
+            the request will SHIP at cut-1 regardless of s10, so
+            target.regen will never be called → SKIP the encode.
+            Otherwise queue for batched target-ViT encode on stream 2.
+          - At cut 1.0 (EOS / max_tokens): pop stashed s00; combine
+            with this step's s10; apply OR-skip:
+              ship iff s00 ≥ τ_L1[src] OR s10 ≥ τ_L2[src]
+            On SHIP, drop the target-ViT slot (cheap — it wasn't
+            dispatched). On REGEN, consume the payload (sync event,
+            slice, CPU).
+
+        Returns:
+          cascade_decisions_dict: req_id -> "SHIP" | "REGEN"
+          target_vit_payloads_dict: req_id -> (cpu_image_embeds, cpu_grid_thw)
+        """
+        if self._cascade_score0_buf is None:
+            if os.environ.get("VLLM_HEAD_CASCADE_LOG_SCORES"):
+                print("[head-cascade] step skipped: score0_buf is None", flush=True)
+            return {}, {}
+        cascade_reqs = self.input_batch.head_cascade_reqs
+        if os.environ.get("VLLM_HEAD_CASCADE_LOG_SCORES"):
+            print(
+                f"[head-cascade] step: cascade_reqs={list(cascade_reqs)[:4]} "
+                f"req_ids={list(self.input_batch.req_ids)[:4]} "
+                f"sampled_lens={[len(v) for v in valid_sampled_token_ids[:4]]}",
+                flush=True,
+            )
+        if not cascade_reqs:
+            return {}, {}
+
+        req_ids = self.input_batch.req_ids
+
+        # Read per-req last-position scores from the model's buffers.
+        # logits_indices selects the per-req last-position slot in the
+        # flat [num_tokens] buffer; transferring [num_reqs] floats is
+        # ~µs CPU cost.
+        s0_per_req = self._cascade_score0_buf[
+            :num_tokens_unpadded
+        ][logits_indices].tolist()
+        s1_per_req = self._cascade_score1_buf[
+            :num_tokens_unpadded
+        ][logits_indices].tolist()
+        src_per_req = self._cascade_src_buf[
+            :num_tokens_unpadded
+        ][logits_indices].tolist()
+
+        cascade_decisions: dict[str, str] = {}
+        target_vit_payloads: dict[
+            str, tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        cut0_reqs_for_encode: list[str] = []
+
+        for i, rid in enumerate(req_ids):
+            if rid is None or rid not in cascade_reqs:
+                continue
+            sampled = (
+                valid_sampled_token_ids[i]
+                if i < len(valid_sampled_token_ids) else []
+            )
+            is_c0 = self._is_cut0_for_req(rid, sampled)
+            is_c1 = self._is_cut1_for_req(rid, sampled)
+
+            if is_c0:
+                # Stash the cut-0 score + predicted source for the
+                # cut-1 OR-skip decision.
+                s00 = float(s0_per_req[i])
+                src_idx_c0 = int(src_per_req[i])
+                self._stashed_score0[rid] = s00
+                self._stashed_src[rid] = src_idx_c0
+                if os.environ.get("VLLM_HEAD_CASCADE_LOG_SCORES"):
+                    print(
+                        f"[head-cascade] rid={rid} cut=0 s={s00:.6f} "
+                        f"src={src_idx_c0}", flush=True,
+                    )
+                # Head-gate the target-ViT encode: if cut-0 already
+                # passes τ_L1, the request will ship at cut-1 (OR-skip)
+                # regardless of s10, so target.regen will never be
+                # called → skip the encode. Saves ~30-60% of stream-2
+                # target-ViT work at our typical skip rates. The
+                # residual waste is only the ~5pp of records that fail
+                # cut-0 (encoded) but pass cut-1 (ship anyway).
+                src_name_c0 = (
+                    self._head_source_vocab[src_idx_c0]
+                    if (self._head_source_vocab is not None
+                        and 0 <= src_idx_c0 < len(self._head_source_vocab))
+                    else "global"
+                )
+                tau_l1_c0, _ = self._tau_table.get(
+                    src_name_c0,
+                    self._tau_table.get("global", (0.5, 0.5)),
+                )
+                if s00 < tau_l1_c0:
+                    cut0_reqs_for_encode.append(rid)
+
+            if is_c1:
+                # Apply OR-skip with stashed s00 + this step's s10.
+                s00 = self._stashed_score0.pop(rid, None)
+                src_idx = self._stashed_src.pop(rid, 0)
+                s10 = float(s1_per_req[i])
+                src_name = (
+                    self._head_source_vocab[src_idx]
+                    if (self._head_source_vocab is not None
+                        and 0 <= src_idx < len(self._head_source_vocab))
+                    else "global"
+                )
+                tau_l1, tau_l2 = self._tau_table.get(
+                    src_name,
+                    self._tau_table.get("global", (0.5, 0.5)),
+                )
+                if (s00 is not None and s00 >= tau_l1) or (s10 >= tau_l2):
+                    cascade_decisions[rid] = "SHIP"
+                    self._drop_target_vit_payload(rid)
+                else:
+                    cascade_decisions[rid] = "REGEN"
+                    payload = self._consume_target_vit_payload(rid)
+                    if payload is not None:
+                        target_vit_payloads[rid] = payload
+                if os.environ.get("VLLM_HEAD_CASCADE_LOG_SCORES"):
+                    print(
+                        f"[head-cascade] rid={rid} cut=1 s={s10:.6f} "
+                        f"src={src_idx}", flush=True,
+                    )
+
+        # Batched target-ViT dispatch for the step's cut-0 reqs.
+        # ALWAYS fires (no head-gating) — see PR design notes.
+        if cut0_reqs_for_encode and self._target_vision is not None:
+            pv_list, thw_list, kept = [], [], []
+            for rid in cut0_reqs_for_encode:
+                mm = self._gather_mm_features_for_req(rid)
+                if mm is None:
+                    continue
+                pv, thw = mm
+                pv_list.append(pv)
+                thw_list.append(thw)
+                kept.append(rid)
+            if os.environ.get("VLLM_HEAD_CASCADE_LOG_SCORES"):
+                print(
+                    f"[head-cascade] encode_batch queued={cut0_reqs_for_encode} "
+                    f"kept={kept}", flush=True,
+                )
+            if pv_list:
+                batch = (
+                    self._target_vision.encode_async_batched_pre_processed(
+                        pv_list, thw_list,
+                    )
+                )
+                batch_meta = {"req_ids": kept, "batch": batch}
+                idx = len(self._target_vit_batches)
+                self._target_vit_batches.append(batch_meta)
+                for r in kept:
+                    self._req_to_target_vit_batch[r] = idx
+
+        return cascade_decisions, target_vit_payloads
+
+    def _consume_target_vit_payload(
+        self, req_id: str,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Slice this req's image_embeds + grid_thw from its batch,
+        synchronize the batch event, move to CPU, and free the slot.
+        Returns None if the req was never registered (e.g., SHIP_BOUND
+        path)."""
+        idx = self._req_to_target_vit_batch.pop(req_id, None)
+        if idx is None:
+            return None
+        meta = self._target_vit_batches[idx]
+        batch = meta["batch"]
+        # Find this req's position within the batch
+        j = meta["req_ids"].index(req_id)
+        # Block (briefly) until target-vit finishes. In practice the
+        # batch was issued at an earlier vLLM step and has had ~200-500
+        # ms of overlap with decode — usually already done.
+        batch.event.synchronize()
+        s_t = batch.offsets_tokens[j]
+        e_t = batch.offsets_tokens[j + 1]
+        s_i = batch.offsets_images[j]
+        e_i = batch.offsets_images[j + 1]
+        embeds = batch.image_embeds[s_t:e_t].contiguous().cpu()
+        thw = batch.image_grid_thw[s_i:e_i].contiguous().cpu()
+        # Cleanup: if this was the last req in the batch, free the slot
+        meta["req_ids"][j] = None
+        if all(x is None for x in meta["req_ids"]):
+            self._target_vit_batches[idx] = None
+        return embeds, thw
+
+    def _drop_target_vit_payload(self, req_id: str) -> None:
+        """SHIP path: discard any pending target-vit slot. GPU memory
+        for the batch frees naturally when the last slot is consumed
+        or via the next __init__-time reset."""
+        idx = self._req_to_target_vit_batch.pop(req_id, None)
+        if idx is None:
+            return
+        meta = self._target_vit_batches[idx]
+        if meta is None:
+            return
+        j = meta["req_ids"].index(req_id)
+        meta["req_ids"][j] = None
+        if all(x is None for x in meta["req_ids"]):
+            self._target_vit_batches[idx] = None
+
+    def _install_extract_hidden_states_buf(self) -> None:
+        """paper_explore SYS1: allocate a fixed buffer on rank-0 cuda:0
+        and stash a reference on the LLM body module so the model's
+        forward writes the targeted decoder layer's hidden states
+        inline (no PyTorch hook needed).
+
+        Pros vs the previous forward-hook design:
+          * Buffer write is a CUDA op like any other — captured into
+            CUDA graphs naturally. Cascade requests can keep
+            PIECEWISE / FULL cudagraph_mode; we drop the forced
+            eager fallback.
+          * No hook attach/detach lifecycle.
+          * Data flow is explicit in the model file (~5 LoC inline
+            capture in Qwen2Model.forward).
+
+        Layer-path resolution is hardcoded for the Qwen2.5-VL family
+        (`model.language_model.model.layers`) with a fallback to plain
+        `model.model.layers` for LLM-only models. CUDAGraphWrapper /
+        UBatchWrapper delegate via `__getattr__`.
+
+        TP-safe: decoder layer outputs are post-allreduce, so all ranks
+        observe the same unsharded tensor. Only the driver's
+        ModelRunnerOutput is shipped back to the scheduler, so non-driver
+        ranks' captured tensors are simply discarded.
+        """
+        if self._extract_hidden_states_layer is None:
+            return
+        N = self._extract_hidden_states_layer
+
+        body = self._resolve_llm_body()
+        layers = body.layers
+        if not (0 <= N < len(layers)):
+            raise ValueError(
+                f"VLLM_EXTRACT_HIDDEN_STATES_LAYER={N} out of range for "
+                f"{len(layers)} decoder layers (must be in [0, "
+                f"{len(layers) - 1}])."
+            )
+        layer_idx = len(layers) - 1 - N
+
+        # Allocate a fixed buffer sized [max_num_batched_tokens, hidden_dim]
+        # on rank-0 cuda:0. The model writes at most num_scheduled_tokens
+        # rows per step; we slice `[:num_scheduled_tokens]` post-forward.
+        hidden_dim = self.model_config.get_hidden_size()
+        max_tokens = self.scheduler_config.max_num_batched_tokens
+        self._captured_hidden_states_buf = torch.zeros(
+            (max_tokens, hidden_dim),
+            dtype=self.dtype,
+            device="cuda:0",
+        )
+        # Stash on the LLM body module so its forward can read these
+        # attributes without needing a forward_context schema change.
+        body._paper_explore_extract_buf = self._captured_hidden_states_buf
+        body._paper_explore_extract_layer_idx = layer_idx
+        # `@support_torch_compile` on Qwen2Model treats missing
+        # attributes as guard violations even when `getattr(...,
+        # default=None)` is used, so init the head-related attrs
+        # to None unconditionally. They get overwritten later in
+        # _load_head_cascade when the head loads.
+        if not hasattr(body, "_paper_explore_head"):
+            body._paper_explore_head = None
+        if not hasattr(body, "_paper_explore_head_forward"):
+            body._paper_explore_head_forward = None
+        if not hasattr(body, "_paper_explore_head_temperature"):
+            body._paper_explore_head_temperature = 1.0
+
+        logger.info(
+            "Installed extract_hidden_states inline capture on decoder "
+            "layer %d-from-end (idx=%d of %d), buf shape=%s. "
+            "Per-request opt-in via SamplingParams.extract_hidden_states.",
+            N,
+            layer_idx,
+            len(layers),
+            tuple(self._captured_hidden_states_buf.shape),
+        )
 
     def _get_eagle3_aux_layers_from_config(self) -> tuple[int, ...] | None:
         """Extract Eagle3 auxiliary layer indices from speculative config.
