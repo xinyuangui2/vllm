@@ -722,6 +722,11 @@ class GPUModelRunner(
         # a TargetVitBatch (with concat'd embeds + event + offsets).
         self._target_vit_batches: list = []
         self._req_to_target_vit_batch: dict[str, int] = {}
+        # Phase C-DP: round-robin which TP rank actually runs each
+        # encode dispatch. Every rank increments this counter (state
+        # mirrors across ranks because every rank sees the same cut-0
+        # batch). The owner rank = counter % tp_world_size.
+        self._target_vit_dispatch_counter: int = 0
         # EOS token ids for cut-1 detection — populated post-load.
         self._head_eos_token_ids: set[int] = set()
         # paper_explore SYS1 cascade: handles to the score / src buffers
@@ -5259,11 +5264,15 @@ class GPUModelRunner(
             return
         if not get_pp_group().is_last_rank:
             return
-        # Only rank 0 of TP holds the head — non-driver TP ranks don't
-        # build ModelRunnerOutput so they have no use for it.
-        from vllm.distributed import get_tp_group
-        if get_tp_group().rank_in_group != 0:
-            return
+        # SYS3 Phase C: load the head on EVERY TP rank.
+        # The head is small (~5 MB) and the hidden_states it consumes are
+        # already replicated across TP ranks (post-RowParallelLinear
+        # all-reduce inside each decoder layer). So all ranks compute
+        # identical scores/source-idx, and they can all run the OR-skip
+        # decision logic locally without broadcasts. This in turn lets
+        # the TP-sharded target-ViT encode dispatch fire on every rank
+        # — required for NCCL collectives inside the visual forward
+        # to make progress.
 
         self._maybe_add_paper_explore_to_path()
         # Re-use the existing builder in paper_explore. Falls back to a
@@ -5302,7 +5311,10 @@ class GPUModelRunner(
             model = _repack_moe_head_for_graph_capture(model)
         # Cast to engine dtype so the head's matmuls match the
         # decoder layer's hidden_states (bfloat16 in our setup).
-        model = model.to("cuda:0", dtype=self.dtype).eval()
+        # Use this worker's local device, not hardcoded cuda:0 — under
+        # the worker-per-process layout, each TP rank's local GPU is
+        # NOT cuda:0 (it is cuda:<rank> in the global device namespace).
+        model = model.to(self.device, dtype=self.dtype).eval()
         for p in model.parameters():
             p.requires_grad_(False)
         self._head_model = model
@@ -5329,11 +5341,16 @@ class GPUModelRunner(
                 float(g.get("tau_l2", 0.5)),
             )
         # Source vocab in head order; argmax(source_logits) returns the
-        # index, we map back via this list. The source_head training
-        # script stashes this in the checkpoint as "source_vocab".
-        # Fall back to sorted keys of the τ table if absent.
-        self._head_source_vocab = ckpt.get(
-            "source_vocab", sorted(self._tau_table.keys()),
+        # index, we map back via this list. Different training paths
+        # store it under different keys:
+        #   - The dedicated source_head script: "source_vocab"
+        #   - MultitaskHead with multitask_domain_mode=source: "domain_vocab"
+        #     (domain labels ARE source labels in that mode)
+        # Fall back to sorted keys of the τ table if neither present.
+        self._head_source_vocab = (
+            ckpt.get("source_vocab")
+            or ckpt.get("domain_vocab")
+            or sorted(self._tau_table.keys())
         )
 
         # EOS ids for cut-1 detection. Pull from the tokenizer.
@@ -5361,7 +5378,9 @@ class GPUModelRunner(
         # itself.
         body = self._resolve_llm_body()
         max_tokens = self.scheduler_config.max_num_batched_tokens
-        device = torch.device("cuda:0")
+        # Use this worker's local device (e.g. cuda:N for TP rank N
+        # under the worker-per-process layout), not hardcoded cuda:0.
+        device = self.device
         # Pos columns in the same dtype as the hidden states so cat
         # without upcast.
         body._paper_explore_head = model
@@ -5414,14 +5433,26 @@ class GPUModelRunner(
         )
 
     def _load_target_vision_encoder(self) -> None:
-        """Load the standalone target-ViT (Qwen2.5-VL .visual subset) on
-        rank-0 cuda:0. Skips silently if env var not set."""
+        """Load the standalone target-ViT (Qwen2.5-VL .visual subset)
+        on the worker's cuda:0. Skips silently if env var not set.
+
+        **SYS3 Phase C (2026-05-12):** previously rank-0-only with full
+        ViT weights (~1 GB at 7B / ~1.8 GB at 72B). Now loads on every
+        TP rank as a TP-sharded vLLM `Qwen2_5_VisionTransformer`:
+        QKV/MLP linears are split via the active TP group, so each
+        rank holds ~1/TP of the weights. KV cache sizing (driven by
+        min-free across ranks) reclaims most of the rank-0 imbalance.
+
+        The encode dispatch in `_run_head_cascade_step` also fires on
+        all ranks now — NCCL collectives inside the visual forward
+        need every TP rank to participate. `CachedRequestState.mm_features`
+        are mirrored across ranks by vLLM's input processor, so each
+        rank's `_gather_mm_features_for_req(rid)` returns matching
+        pixel_values + grid_thw.
+        """
         if not self._target_vision_model_id:
             return
         if not get_pp_group().is_last_rank:
-            return
-        from vllm.distributed import get_tp_group
-        if get_tp_group().rank_in_group != 0:
             return
 
         self._maybe_add_paper_explore_to_path()
@@ -5436,12 +5467,23 @@ class GPUModelRunner(
             )
         self._target_vision = TargetVisionEncoder(
             target_model_id=self._target_vision_model_id,
-            device="cuda:0",
+            device=self.device,
             dtype=torch.bfloat16,
+            # Step B: dedicated stream so the encode's TP collectives
+            # can overlap with the next main-forward step on the default
+            # stream. NCCL ordering: all 4 ranks call collectives in the
+            # same Python-level order within execute_model (main forward
+            # → cascade-step → encode), so the shared TP comm stays
+            # ordered even across streams. Stream A is the right
+            # fallback if a deadlock shows up at higher concurrency.
+            use_dedicated_stream=True,
         )
+        from vllm.distributed import get_tp_group
+        tp_rank = get_tp_group().rank_in_group
         logger.info(
-            "Loaded standalone target-ViT for head-cascade offload: %s",
-            self._target_vision_model_id,
+            "Loaded TP-sharded target-ViT for head-cascade offload: %s "
+            "(tp_rank=%d)",
+            self._target_vision_model_id, tp_rank,
         )
 
     # ------------------------------------------------------------------
@@ -5727,48 +5769,189 @@ class GPUModelRunner(
                     f"kept={kept}", flush=True,
                 )
             if pv_list:
-                batch = (
-                    self._target_vision.encode_async_batched_pre_processed(
-                        pv_list, thw_list,
-                    )
+                # Phase C-DP: round-robin which TP rank runs this
+                # dispatch. Every rank advances the counter (same state
+                # everywhere). Only the owner rank actually invokes the
+                # encode forward; other ranks store `batch=None`. At
+                # cut-1 (REGEN), the owner ships the per-rid payload
+                # slice to rank-0 via dist.send/recv (see
+                # `_consume_target_vit_payload`).
+                # Chunk the dispatch so a single step's cut-0 wave
+                # doesn't blow up the leader GPU's activation memory
+                # (HF ViT on 7B-VL needs ~100-200 MB activations per
+                # image × 32 layers; batches of 64 OOM at A10G's 22 GB
+                # even at gpu_memory_utilization=0.85). The fortunate
+                # side effect: each chunk gets its OWN leader via the
+                # counter, so 4+ chunks in one step → 4+ DIFFERENT
+                # ranks running in parallel. Cap is env-tunable.
+                max_per_dispatch = int(os.environ.get(
+                    "VLLM_TARGET_VIT_MAX_BATCH", "16",
+                ))
+                merge_sq = (
+                    self._target_vision._spatial_merge_size ** 2
                 )
-                batch_meta = {"req_ids": kept, "batch": batch}
-                idx = len(self._target_vit_batches)
-                self._target_vit_batches.append(batch_meta)
-                for r in kept:
-                    self._req_to_target_vit_batch[r] = idx
+                from vllm.distributed import get_tp_group
+                tp_grp = get_tp_group()
+                my_rank = tp_grp.rank_in_group
+                world = tp_grp.world_size
+
+                n_total = len(pv_list)
+                for chunk_start in range(0, n_total, max_per_dispatch):
+                    chunk_end = min(
+                        chunk_start + max_per_dispatch, n_total,
+                    )
+                    pv_chunk = pv_list[chunk_start:chunk_end]
+                    thw_chunk = thw_list[chunk_start:chunk_end]
+                    kept_chunk = kept[chunk_start:chunk_end]
+
+                    # Per-chunk offsets (deterministic on every rank).
+                    offsets_tokens = [0]
+                    offsets_images = [0]
+                    for thw in thw_chunk:
+                        rows = (
+                            thw.cpu().tolist()
+                            if thw.device.type == "cuda" else thw.tolist()
+                        )
+                        if rows and isinstance(rows[0], int):
+                            rows = [rows]
+                        n_tokens = sum(
+                            t * h * w for t, h, w in rows
+                        ) // merge_sq
+                        offsets_tokens.append(
+                            offsets_tokens[-1] + int(n_tokens)
+                        )
+                        offsets_images.append(
+                            offsets_images[-1] + len(rows)
+                        )
+
+                    chunk_leader = (
+                        self._target_vit_dispatch_counter % world
+                    )
+                    self._target_vit_dispatch_counter += 1
+
+                    if my_rank == chunk_leader:
+                        batch = (
+                            self._target_vision
+                            .encode_async_batched_pre_processed(
+                                pv_chunk, thw_chunk,
+                            )
+                        )
+                    else:
+                        batch = None
+                    batch_meta = {
+                        "req_ids": kept_chunk,
+                        "batch": batch,
+                        "leader": chunk_leader,
+                        "offsets_tokens": offsets_tokens,
+                        "offsets_images": offsets_images,
+                    }
+                    idx = len(self._target_vit_batches)
+                    self._target_vit_batches.append(batch_meta)
+                    for r in kept_chunk:
+                        self._req_to_target_vit_batch[r] = idx
 
         return cascade_decisions, target_vit_payloads
+
 
     def _consume_target_vit_payload(
         self, req_id: str,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """Slice this req's image_embeds + grid_thw from its batch,
-        synchronize the batch event, move to CPU, and free the slot.
-        Returns None if the req was never registered (e.g., SHIP_BOUND
-        path)."""
+        """Phase C-DP: deliver this req's image_embeds + grid_thw to
+        rank-0 (the cascade-decision driver). The encode for this batch
+        was performed by `meta["leader"]` rank; the per-rid slice now
+        crosses ranks via NCCL p2p if the leader is not rank-0.
+
+        Returns the (embeds, thw) pair on rank-0. On non-rank-0 ranks,
+        returns None (their result is discarded by the engine driver),
+        but they MUST still call this to participate in the p2p send if
+        they are the leader. All ranks call this for the same rid in the
+        same order, so the cleanup keeps `_target_vit_batches` in sync.
+        """
         idx = self._req_to_target_vit_batch.pop(req_id, None)
         if idx is None:
             return None
         meta = self._target_vit_batches[idx]
-        batch = meta["batch"]
-        # Find this req's position within the batch
+        if meta is None:
+            return None
+        leader = meta["leader"]
+        offsets_t = meta["offsets_tokens"]
+        offsets_i = meta["offsets_images"]
         j = meta["req_ids"].index(req_id)
-        # Block (briefly) until target-vit finishes. In practice the
-        # batch was issued at an earlier vLLM step and has had ~200-500
-        # ms of overlap with decode — usually already done.
-        batch.event.synchronize()
-        s_t = batch.offsets_tokens[j]
-        e_t = batch.offsets_tokens[j + 1]
-        s_i = batch.offsets_images[j]
-        e_i = batch.offsets_images[j + 1]
-        embeds = batch.image_embeds[s_t:e_t].contiguous().cpu()
-        thw = batch.image_grid_thw[s_i:e_i].contiguous().cpu()
-        # Cleanup: if this was the last req in the batch, free the slot
+        s_t, e_t = offsets_t[j], offsets_t[j + 1]
+        s_i, e_i = offsets_i[j], offsets_i[j + 1]
+        n_tokens = e_t - s_t
+        n_images = e_i - s_i
+
+        from vllm.distributed import get_tp_group
+        tp_grp = get_tp_group()
+        my_rank = tp_grp.rank_in_group
+        # `device_group` is the underlying torch ProcessGroup (NCCL).
+        nccl_group = tp_grp.device_group
+
+        result: tuple[torch.Tensor, torch.Tensor] | None = None
+
+        if my_rank == leader:
+            batch = meta["batch"]
+            # Block (briefly) until the encode completes — usually
+            # already done since the encode was issued an earlier step.
+            batch.event.synchronize()
+            embeds_gpu = batch.image_embeds[s_t:e_t].contiguous()
+            thw_gpu = batch.image_grid_thw[s_i:e_i].contiguous()
+            if my_rank == 0:
+                # I'm both leader and rank-0 — local consume, no p2p.
+                result = (embeds_gpu.cpu(), thw_gpu.cpu())
+            else:
+                # Ship to rank-0. Send a tiny shape header first so
+                # rank-0 can allocate the recv buffer without knowing
+                # the visual's output hidden dim (handles HF vs vLLM
+                # ViT variants that produce different per-token widths).
+                import torch.distributed as dist
+                tag = idx * 8192 + j  # unique within run
+                shape_t = torch.tensor(
+                    [embeds_gpu.shape[0], embeds_gpu.shape[1]],
+                    dtype=torch.long, device=self.device,
+                )
+                dist.send(
+                    shape_t, dst=0, group=nccl_group, tag=tag,
+                )
+                dist.send(
+                    embeds_gpu, dst=0, group=nccl_group, tag=tag + 1,
+                )
+                dist.send(
+                    thw_gpu, dst=0, group=nccl_group, tag=tag + 2,
+                )
+        elif my_rank == 0:
+            # Leader is some non-zero rank — fetch via p2p recv.
+            import torch.distributed as dist
+            tag = idx * 8192 + j
+            shape_t = torch.zeros(
+                2, dtype=torch.long, device=self.device,
+            )
+            dist.recv(
+                shape_t, src=leader, group=nccl_group, tag=tag,
+            )
+            n_tok = int(shape_t[0].item())
+            out_dim = int(shape_t[1].item())
+            embeds_gpu = torch.zeros(
+                (n_tok, out_dim), dtype=self.dtype, device=self.device,
+            )
+            thw_gpu = torch.zeros(
+                (n_images, 3), dtype=torch.long, device=self.device,
+            )
+            dist.recv(
+                embeds_gpu, src=leader, group=nccl_group, tag=tag + 1,
+            )
+            dist.recv(
+                thw_gpu, src=leader, group=nccl_group, tag=tag + 2,
+            )
+            result = (embeds_gpu.cpu(), thw_gpu.cpu())
+        # else: neither leader nor rank-0 — nothing to send/recv.
+
+        # Cleanup (all ranks): mark this slot consumed.
         meta["req_ids"][j] = None
         if all(x is None for x in meta["req_ids"]):
             self._target_vit_batches[idx] = None
-        return embeds, thw
+        return result
 
     def _drop_target_vit_payload(self, req_id: str) -> None:
         """SHIP path: discard any pending target-vit slot. GPU memory
@@ -5825,14 +6008,15 @@ class GPUModelRunner(
         layer_idx = len(layers) - 1 - N
 
         # Allocate a fixed buffer sized [max_num_batched_tokens, hidden_dim]
-        # on rank-0 cuda:0. The model writes at most num_scheduled_tokens
-        # rows per step; we slice `[:num_scheduled_tokens]` post-forward.
+        # on this worker's local device. The model writes at most
+        # num_scheduled_tokens rows per step; we slice
+        # `[:num_scheduled_tokens]` post-forward.
         hidden_dim = self.model_config.get_hidden_size()
         max_tokens = self.scheduler_config.max_num_batched_tokens
         self._captured_hidden_states_buf = torch.zeros(
             (max_tokens, hidden_dim),
             dtype=self.dtype,
-            device="cuda:0",
+            device=self.device,
         )
         # Stash on the LLM body module so its forward can read these
         # attributes without needing a forward_context schema change.
