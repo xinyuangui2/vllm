@@ -407,9 +407,23 @@ class InputBatch:
                     else sampling_params.logprobs
                 )
 
-            if sampling_params.extract_hidden_states or sampling_params.head_cascade:
-                # head_cascade implies extract_hidden_states (the cascade
-                # needs the hidden-state hook to be active).
+            if sampling_params.extract_hidden_states:
+                # NOTE: previously this branch also fired when
+                # `sampling_params.head_cascade` was True, on the
+                # theory that "head_cascade implies extract". That
+                # was wrong: the cascade head runs INLINE inside
+                # Qwen2Model.forward and reads hidden_states directly
+                # from the layer's output. The extract path
+                # (populating hidden_states_dict via a GPU→CPU
+                # synchronous copy in execute_model) is only needed
+                # for the user-facing RequestOutput.hidden_states,
+                # which cascade-only requests don't consume.
+                # Auto-enabling extract for head_cascade reqs caused
+                # ~10% throughput regression on long-output VLM
+                # workloads (forced per-step D→H sync stalled the
+                # decode pipeline). Phase 3's numerical-match
+                # validation still works because `sys2_capture_hidden_states.py`
+                # sets extract_hidden_states=True explicitly.
                 self.extract_hidden_states_reqs.add(req_id)
 
             if sampling_params.head_cascade:
