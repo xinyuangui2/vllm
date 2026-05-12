@@ -462,30 +462,32 @@ class Qwen2Model(nn.Module, EagleModelMixin):
                     # and chooses pos=0 score at cut-0 boundary / pos=1
                     # score at cut-1 boundary.
                     #
-                    # NOTE: the cat + head call below allocates inside
-                    # the CUDA-graph capture region (empty_strided_cuda
-                    # for the head's MoE expert-cat / hidden_states
-                    # materialization), which fails with
-                    # cudaErrorStreamCaptureUnsupported. For now,
-                    # cascade requires `enforce_eager=True`.
-                    # `@torch._dynamo.disable` on this block is rejected
-                    # by vLLM's `@support_torch_compile` (no graph
-                    # breaks allowed). Fix needs either a graph-safe
-                    # head (no mid-forward alloc) or moving the head
-                    # call OUT of model.forward into the engine's post-
-                    # forward path.
+                    # FusedMoEHead exposes forward_pos0 / forward_pos1
+                    # that absorb the pos column into pre-baked first-
+                    # layer biases. Calling them with raw hidden_states
+                    # avoids `torch.cat([hidden_states, pos], dim=-1)`,
+                    # which inductor would materialize as an
+                    # `empty_strided_cuda` mid-graph (illegal under
+                    # CUDA graph capture). For non-fused heads (older
+                    # checkpoints), fall back to the cat-then-call
+                    # path — those still require enforce_eager=True.
                     T = self._paper_explore_head_temperature
-                    x0 = torch.cat(
-                        [hidden_states, self._pos0_col[:n]], dim=-1,
-                    )
-                    x1 = torch.cat(
-                        [hidden_states, self._pos1_col[:n]], dim=-1,
-                    )
-                    # Call the head directly: paper_explore heads
-                    # (multitask, MoE) both return 2 tensors from
-                    # forward — (score_logits, source_or_gate).
-                    score0_logits, src_logits = cascade_head(x0)
-                    score1_logits, _ = cascade_head(x1)
+                    if hasattr(cascade_head, "forward_pos0"):
+                        score0_logits, src_logits = cascade_head.forward_pos0(
+                            hidden_states
+                        )
+                        score1_logits, _ = cascade_head.forward_pos1(
+                            hidden_states
+                        )
+                    else:
+                        x0 = torch.cat(
+                            [hidden_states, self._pos0_col[:n]], dim=-1,
+                        )
+                        x1 = torch.cat(
+                            [hidden_states, self._pos1_col[:n]], dim=-1,
+                        )
+                        score0_logits, src_logits = cascade_head(x0)
+                        score1_logits, _ = cascade_head(x1)
                     if score0_logits.dim() > 1:
                         score0_logits = score0_logits.squeeze(-1)
                         score1_logits = score1_logits.squeeze(-1)

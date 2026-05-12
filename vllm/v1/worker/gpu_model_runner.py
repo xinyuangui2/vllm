@@ -287,6 +287,183 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         return output
 
 
+class _FusedMoEHead(torch.nn.Module):
+    """Graph-capture-friendly drop-in for paper_explore's MoEHead.
+
+    Two problems with the original `MoEHead` under CUDA graph
+    capture:
+      1. `torch.cat([e(x) for e in self.experts], dim=-1)` —
+         list comp over `nn.ModuleList` is unrolled by Inductor
+         into K per-expert subgraphs plus a cat that allocates
+         `empty_strided_cuda` mid-capture.
+      2. The expected input is `cat([hidden_states, pos_col], -1)`
+         where `pos_col ∈ {0, 1}`. The outer `torch.cat` ALSO
+         materializes hidden_states (often a non-contig view of
+         the fused-norm output) into a fresh `empty_strided_cuda`
+         buffer, which is the actual error trace we saw.
+
+    This fused form fixes BOTH:
+      • Per-expert matmuls collapse into a single einsum.
+      • The pos column is absorbed into per-expert biases. The
+        head's forward takes raw hidden_states (no cat needed)
+        and exposes `forward_pos0` / `forward_pos1` methods.
+
+    Math (in_dim D=hidden_dim+1, hidden H, n_experts E,
+          input x has the LAST column pos ∈ {0, 1}):
+
+      first_layer(cat([h, pos])) = W[:, :D-1] @ h + W[:, D-1:] * pos + b
+                                 = W_h @ h + (W_p * pos) + b
+
+    For pos=0: bias = b
+    For pos=1: bias = b + W_p.squeeze(-1)
+
+    So we keep W_h (without the pos column) and pre-bake two
+    biases: b_pos0 = b, b_pos1 = b + W_p.squeeze(-1). The rest
+    of the head (LeakyReLU, second linear) sees no change.
+
+    Shapes (hidden_dim Dh, gate hidden 64, expert hidden H,
+            n_experts E):
+      gate_W_h:     [64, Dh]    (gate first Linear weight without pos col)
+      gate_b_pos0: [64]         (gate first Linear bias)
+      gate_b_pos1: [64]         (gate_b_pos0 + W_p_col)
+      gate_W2:     [E, 64]      (gate second Linear weight)
+      gate_b2:     [E]          (gate second Linear bias)
+      W1_h:        [E, H, Dh]   (expert first Linear weight without pos col)
+      b1_pos0:     [E, H]
+      b1_pos1:     [E, H]
+      W2:          [E, 1, H]    (expert second Linear weight)
+      b2:          [E, 1]
+
+    Forward returns `(logit_unsqueezed, gate_softmax)` to match
+    the original two-tensor return that qwen2.Qwen2Model.forward
+    unpacks as `(score_logits, src_logits)`.
+    """
+
+    def __init__(self,
+                 n_experts: int,
+                 gate_W_h: torch.Tensor, gate_b_pos0: torch.Tensor,
+                 gate_b_pos1: torch.Tensor,
+                 gate_W2: torch.Tensor, gate_b2: torch.Tensor,
+                 W1_h: torch.Tensor, b1_pos0: torch.Tensor,
+                 b1_pos1: torch.Tensor,
+                 W2: torch.Tensor, b2: torch.Tensor):
+        super().__init__()
+        self.n_experts = n_experts
+        P = torch.nn.Parameter
+        self.gate_W_h    = P(gate_W_h,    requires_grad=False)
+        self.gate_b_pos0 = P(gate_b_pos0, requires_grad=False)
+        self.gate_b_pos1 = P(gate_b_pos1, requires_grad=False)
+        self.gate_W2     = P(gate_W2,     requires_grad=False)
+        self.gate_b2     = P(gate_b2,     requires_grad=False)
+        self.W1_h    = P(W1_h,    requires_grad=False)
+        self.b1_pos0 = P(b1_pos0, requires_grad=False)
+        self.b1_pos1 = P(b1_pos1, requires_grad=False)
+        self.W2  = P(W2,  requires_grad=False)
+        self.b2  = P(b2,  requires_grad=False)
+
+    def _impl(self, x: torch.Tensor,
+              gate_b_pos: torch.Tensor, b1_pos: torch.Tensor):
+        # x: [B, Dh] — raw hidden_states, no pos column
+        gate_h = torch.nn.functional.linear(x, self.gate_W_h, gate_b_pos)
+        gate_h = torch.nn.functional.leaky_relu(gate_h, 0.01)
+        gate_logits = torch.nn.functional.linear(gate_h, self.gate_W2, self.gate_b2)
+        gate = torch.softmax(gate_logits, dim=-1)             # [B, E]
+        # All experts in parallel: [E, H, Dh] @ [B, Dh] -> [B, E, H]
+        h = torch.einsum("ehd,bd->beh", self.W1_h, x) + b1_pos.unsqueeze(0)
+        h = torch.nn.functional.leaky_relu(h, 0.01)
+        # Per-expert scalar: [E, 1, H] @ [B, E, H] -> [B, E, 1]
+        o = torch.einsum("eod,bed->beo", self.W2, h) + self.b2.unsqueeze(0)
+        out = o.squeeze(-1)                                    # [B, E]
+        logit = (gate * out).sum(dim=-1, keepdim=True)         # [B, 1]
+        return logit, gate
+
+    def forward_pos0(self, x: torch.Tensor):
+        return self._impl(x, self.gate_b_pos0, self.b1_pos0)
+
+    def forward_pos1(self, x: torch.Tensor):
+        return self._impl(x, self.gate_b_pos1, self.b1_pos1)
+
+    # Backward-compatible: if someone passes the original
+    # cat([h, pos]) input, split off the pos column and route.
+    def forward(self, x: torch.Tensor):
+        # If x has the original 3585 cols, the LAST col is pos.
+        # Detect by shape: gate_W_h.shape[1] is the no-pos input dim.
+        if x.shape[-1] == self.gate_W_h.shape[1] + 1:
+            pos = x[..., -1:]
+            x_h = x[..., :-1]
+            # Two passes — caller should prefer forward_pos0/1.
+            return self._impl(
+                x_h,
+                self.gate_b_pos0 if (pos.sum() == 0) else self.gate_b_pos1,
+                self.b1_pos0     if (pos.sum() == 0) else self.b1_pos1,
+            )
+        # Otherwise assume pos=0 (default behavior).
+        return self.forward_pos0(x)
+
+
+def _repack_moe_head_for_graph_capture(model: torch.nn.Module) -> torch.nn.Module:
+    """Take a paper_explore `MoEHead` instance (already loaded with
+    state_dict on CPU) and return a `_FusedMoEHead` with the same
+    learned weights, suitable for CUDA graph capture.
+
+    Also splits the pos column out of all first-layer Linear weights
+    and pre-bakes pos=0 / pos=1 biases so the head can be called
+    with raw hidden_states (no `torch.cat`)."""
+    if not hasattr(model, "experts") or not hasattr(model, "gate"):
+        raise RuntimeError(
+            f"_repack_moe_head_for_graph_capture: expected a paper_explore "
+            f"MoEHead with .gate and .experts, got {type(model).__name__}"
+        )
+    # paper_explore MoEHead's gate: Sequential(Linear(D, 64), LeakyReLU, Linear(64, E)).
+    # paper_explore MoEHead's experts[k]: Sequential(Linear(D, H), LeakyReLU,
+    #   Dropout|Identity, Linear(H, 1)).
+    # D = hidden_dim + pos_dim (typically 3584 + 1 = 3585). The last input
+    # column corresponds to pos ∈ {0, 1}.
+
+    # ---- gate ----
+    g_first  = model.gate[0]                # Linear(D, 64)
+    g_second = model.gate[-1]               # Linear(64, E)
+    D = g_first.weight.shape[1]             # 3585
+    gate_W_h    = g_first.weight.data[:, :-1].clone()  # [64, D-1]
+    gate_W_p    = g_first.weight.data[:, -1].clone()   # [64]
+    gate_b_pos0 = g_first.bias.data.clone()            # [64]
+    gate_b_pos1 = (gate_b_pos0 + gate_W_p).clone()     # [64]
+    gate_W2 = g_second.weight.data.clone()  # [E, 64]
+    gate_b2 = g_second.bias.data.clone()    # [E]
+
+    # ---- experts ----
+    experts = model.experts
+    n_experts = len(experts)
+    # First Linear per expert: weight [H, D], bias [H].
+    W1_h_list, b1_pos0_list, b1_pos1_list = [], [], []
+    for e in experts:
+        first = e[0]
+        last  = e[-1]
+        assert first.weight.shape[1] == D, (
+            f"expert first-Linear in_features={first.weight.shape[1]} "
+            f"does not match gate in_features={D}"
+        )
+        W_h = first.weight.data[:, :-1].clone()  # [H, D-1]
+        W_p = first.weight.data[:, -1].clone()   # [H]
+        b   = first.bias.data.clone()            # [H]
+        W1_h_list.append(W_h)
+        b1_pos0_list.append(b)
+        b1_pos1_list.append(b + W_p)
+    W1_h    = torch.stack(W1_h_list,    dim=0)  # [E, H, D-1]
+    b1_pos0 = torch.stack(b1_pos0_list, dim=0)  # [E, H]
+    b1_pos1 = torch.stack(b1_pos1_list, dim=0)  # [E, H]
+    # Second Linear per expert: weight [1, H], bias [1].
+    W2 = torch.stack([e[-1].weight.data for e in experts], dim=0)  # [E, 1, H]
+    b2 = torch.stack([e[-1].bias.data   for e in experts], dim=0)  # [E, 1]
+
+    return _FusedMoEHead(
+        n_experts,
+        gate_W_h, gate_b_pos0, gate_b_pos1, gate_W2, gate_b2,
+        W1_h, b1_pos0, b1_pos1,
+        W2, b2,
+    )
+
+
 def _copy_pooler_output_to_cpu(
     raw_pooler_output: PoolerOutput, finished_mask: list[bool]
 ) -> list[torch.Tensor | None]:
@@ -5090,6 +5267,15 @@ class GPUModelRunner(
         n_domains = len(domain_vocab)
         model, fwd = build_model_from_ckpt(ckpt, in_dim, n_domains)
         model.load_state_dict(ckpt["state_dict"])
+        # For the MoE head, repack per-expert Linear weights into
+        # stacked 3-D tensors so the forward fuses into a single
+        # einsum. The original implementation does
+        # `torch.cat([e(x) for e in self.experts], dim=-1)` which
+        # Inductor lowers to `empty_strided_cuda` mid-graph and
+        # breaks CUDA graph capture.
+        arch = cargs.get("architecture", "mlp")
+        if arch == "moe":
+            model = _repack_moe_head_for_graph_capture(model)
         # Cast to engine dtype so the head's matmuls match the
         # decoder layer's hidden_states (bfloat16 in our setup).
         model = model.to("cuda:0", dtype=self.dtype).eval()
@@ -5628,6 +5814,17 @@ class GPUModelRunner(
         # attributes without needing a forward_context schema change.
         body._paper_explore_extract_buf = self._captured_hidden_states_buf
         body._paper_explore_extract_layer_idx = layer_idx
+        # `@support_torch_compile` on Qwen2Model treats missing
+        # attributes as guard violations even when `getattr(...,
+        # default=None)` is used, so init the head-related attrs
+        # to None unconditionally. They get overwritten later in
+        # _load_head_cascade when the head loads.
+        if not hasattr(body, "_paper_explore_head"):
+            body._paper_explore_head = None
+        if not hasattr(body, "_paper_explore_head_forward"):
+            body._paper_explore_head_forward = None
+        if not hasattr(body, "_paper_explore_head_temperature"):
+            body._paper_explore_head_temperature = 1.0
 
         logger.info(
             "Installed extract_hidden_states inline capture on decoder "
