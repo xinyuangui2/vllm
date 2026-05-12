@@ -5316,14 +5316,17 @@ class GPUModelRunner(
 
         Engine policy:
           - At cut 0.0 (first decode step): stash score_at_pos0 +
-            predicted source, ALWAYS dispatch target-ViT (no cut-0
-            short-circuit — target-ViT is always speculatively encoded
-            during draft decode).
+            predicted source. Head-gate the target-ViT dispatch — if
+            s00 ≥ τ_L1[src] (the cut-0 OR-skip arm already passes),
+            the request will SHIP at cut-1 regardless of s10, so
+            target.regen will never be called → SKIP the encode.
+            Otherwise queue for batched target-ViT encode on stream 2.
           - At cut 1.0 (EOS / max_tokens): pop stashed s00; combine
             with this step's s10; apply OR-skip:
               ship iff s00 ≥ τ_L1[src] OR s10 ≥ τ_L2[src]
-            On SHIP, drop the target-ViT slot. On REGEN, consume the
-            payload (sync event, slice, CPU).
+            On SHIP, drop the target-ViT slot (cheap — it wasn't
+            dispatched). On REGEN, consume the payload (sync event,
+            slice, CPU).
 
         Returns:
           cascade_decisions_dict: req_id -> "SHIP" | "REGEN"
@@ -5368,12 +5371,31 @@ class GPUModelRunner(
             is_c1 = self._is_cut1_for_req(rid, sampled)
 
             if is_c0:
-                # Stash the cut-0 score + predicted source. Always queue
-                # for target-ViT encode regardless of the score value
-                # (no head-gated dispatch — see commit message).
-                self._stashed_score0[rid] = float(s0_per_req[i])
-                self._stashed_src[rid] = int(src_per_req[i])
-                cut0_reqs_for_encode.append(rid)
+                # Stash the cut-0 score + predicted source for the
+                # cut-1 OR-skip decision.
+                s00 = float(s0_per_req[i])
+                src_idx_c0 = int(src_per_req[i])
+                self._stashed_score0[rid] = s00
+                self._stashed_src[rid] = src_idx_c0
+                # Head-gate the target-ViT encode: if cut-0 already
+                # passes τ_L1, the request will ship at cut-1 (OR-skip)
+                # regardless of s10, so target.regen will never be
+                # called → skip the encode. Saves ~30-60% of stream-2
+                # target-ViT work at our typical skip rates. The
+                # residual waste is only the ~5pp of records that fail
+                # cut-0 (encoded) but pass cut-1 (ship anyway).
+                src_name_c0 = (
+                    self._head_source_vocab[src_idx_c0]
+                    if (self._head_source_vocab is not None
+                        and 0 <= src_idx_c0 < len(self._head_source_vocab))
+                    else "global"
+                )
+                tau_l1_c0, _ = self._tau_table.get(
+                    src_name_c0,
+                    self._tau_table.get("global", (0.5, 0.5)),
+                )
+                if s00 < tau_l1_c0:
+                    cut0_reqs_for_encode.append(rid)
 
             if is_c1:
                 # Apply OR-skip with stashed s00 + this step's s10.
