@@ -4315,8 +4315,17 @@ class GPUModelRunner(
             # step. logits_indices indexes into that range.
             captured = self._captured_hidden_states_buf[:num_tokens_unpadded]
             try:
+                # `non_blocking=False` on this GPU→CPU copy is load-bearing.
+                # The capture diagnostic in Phase 3 of the SYS2 smoke showed
+                # that with non_blocking=True, the FIRST yield's
+                # RequestOutput.hidden_states is a zero tensor for all but
+                # the last submitted request: the async D→H memcpy hadn't
+                # landed before the `.contiguous().clone()` below read the
+                # CPU buffer, so the clone captured uninitialized memory
+                # (zeros). Cost of forcing the sync: ~50-200 µs per step,
+                # well below the noise floor of the per-step decode wall.
                 last_token_hs = captured[logits_indices].to(
-                    "cpu", non_blocking=True
+                    "cpu", non_blocking=False
                 )
             except Exception as e:  # pragma: no cover - defensive
                 logger.warning(
