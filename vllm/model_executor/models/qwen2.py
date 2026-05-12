@@ -461,6 +461,19 @@ class Qwen2Model(nn.Module, EagleModelMixin):
                     # last-position score post-forward via logits_indices,
                     # and chooses pos=0 score at cut-0 boundary / pos=1
                     # score at cut-1 boundary.
+                    #
+                    # NOTE: the cat + head call below allocates inside
+                    # the CUDA-graph capture region (empty_strided_cuda
+                    # for the head's MoE expert-cat / hidden_states
+                    # materialization), which fails with
+                    # cudaErrorStreamCaptureUnsupported. For now,
+                    # cascade requires `enforce_eager=True`.
+                    # `@torch._dynamo.disable` on this block is rejected
+                    # by vLLM's `@support_torch_compile` (no graph
+                    # breaks allowed). Fix needs either a graph-safe
+                    # head (no mid-forward alloc) or moving the head
+                    # call OUT of model.forward into the engine's post-
+                    # forward path.
                     T = self._paper_explore_head_temperature
                     x0 = torch.cat(
                         [hidden_states, self._pos0_col[:n]], dim=-1,

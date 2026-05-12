@@ -414,6 +414,12 @@ class InputBatch:
 
             if sampling_params.head_cascade:
                 self.head_cascade_reqs.add(req_id)
+                import os as _os
+                if _os.environ.get("VLLM_HEAD_CASCADE_LOG_SCORES"):
+                    print(
+                        f"[head-cascade] add_request rid={req_id} "
+                        f"max_tokens={sampling_params.max_tokens}", flush=True,
+                    )
 
             if sampling_params.allowed_token_ids:
                 self.has_allowed_token_ids.add(req_id)

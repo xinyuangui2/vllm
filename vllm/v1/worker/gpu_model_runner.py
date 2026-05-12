@@ -5244,15 +5244,20 @@ class GPUModelRunner(
         sampled_token_ids_for_req: list[int],
     ) -> bool:
         """Cut 0.0 fires on the step where the request first emits a
-        token, i.e. immediately after prefill finishes. At this point
-        scheduler hasn't appended yet, so request.output_token_ids is
-        empty and sampled_token_ids[i] is non-empty."""
+        token, i.e. immediately after prefill finishes.
+
+        NOTE: `_run_head_cascade_step` runs AFTER
+        `_update_states_after_model_execute` has extended
+        `req.output_token_ids` with the just-sampled tokens. So
+        "no tokens before this step" means output_token_ids consists
+        ENTIRELY of what we just sampled."""
         req = self.requests.get(req_id)
-        if req is None:
+        if req is None or not sampled_token_ids_for_req:
             return False
+        n_sampled = len(sampled_token_ids_for_req)
         return (
-            len(req.output_token_ids) == 0
-            and len(sampled_token_ids_for_req) > 0
+            len(req.output_token_ids) == n_sampled
+            and n_sampled > 0
         )
 
     def _is_cut1_for_req(
@@ -5263,7 +5268,12 @@ class GPUModelRunner(
         """Cut 1.0 fires on the step where this request emits EOS or
         will hit max_tokens. The actual finish-reason determination
         happens in scheduler.update_from_output AFTER this; we
-        anticipate it by inspecting the just-sampled tokens here."""
+        anticipate it by inspecting the just-sampled tokens here.
+
+        NOTE: like _is_cut0_for_req, this runs AFTER
+        `_update_states_after_model_execute` has extended
+        `req.output_token_ids`; the just-sampled tokens are already
+        included in the count."""
         req = self.requests.get(req_id)
         if req is None or not sampled_token_ids_for_req:
             return False
@@ -5275,8 +5285,9 @@ class GPUModelRunner(
             eos_ids.update(sp.stop_token_ids)
         if any(tok in eos_ids for tok in sampled_token_ids_for_req):
             return True
-        # Length-style finish.
-        new_total = len(req.output_token_ids) + len(sampled_token_ids_for_req)
+        # Length-style finish. output_token_ids already includes the
+        # just-sampled tokens (extend happened before us).
+        new_total = len(req.output_token_ids)
         max_tokens = sp.max_tokens if sp is not None else None
         if max_tokens is not None and new_total >= max_tokens:
             return True
@@ -5287,17 +5298,55 @@ class GPUModelRunner(
         request from CachedRequestState. Returns None if the request
         has no multi-modal features (text-only)."""
         req = self.requests.get(req_id)
+        if os.environ.get("VLLM_HEAD_CASCADE_LOG_SCORES"):
+            mmf_summary = (
+                f"n_mm_features={len(req.mm_features) if req and req.mm_features else 0}"
+                if req is not None else "req=None"
+            )
+            if req is not None and req.mm_features:
+                mmf_summary += f" mmf0_attrs={sorted(a for a in dir(req.mm_features[0]) if not a.startswith('_'))[:10]}"
+            print(f"[head-cascade] gather_mm rid={req_id} {mmf_summary}", flush=True)
         if req is None or not req.mm_features:
             return None
         # Use the first image's features. Multi-image requests would
         # need a join across all mm_features rows; defer that to
         # follow-up — our 5 VLM benchmarks are single-image.
+        # vLLM v1's MultiModalFeature has the pre-processed tensors
+        # nested inside `mmf.data` (a MultiModalKwargs dict). Each
+        # field's value is a `MultiModalFieldElem` whose `.data` is
+        # the raw tensor.
+        def _unwrap(v):
+            if v is None or isinstance(v, torch.Tensor):
+                return v
+            inner = getattr(v, "data", None)
+            return inner if isinstance(inner, torch.Tensor) else None
+
         pv_chunks, thw_chunks = [], []
         for mmf in req.mm_features:
             pv = getattr(mmf, "pixel_values", None)
             thw = getattr(mmf, "image_grid_thw", None)
             if pv is None or thw is None:
+                data = getattr(mmf, "data", None)
+                if data is not None:
+                    pv = pv if pv is not None else _unwrap(data.get("pixel_values"))
+                    thw = thw if thw is not None else _unwrap(data.get("image_grid_thw"))
+            if pv is None or thw is None:
+                if os.environ.get("VLLM_HEAD_CASCADE_LOG_SCORES"):
+                    keys = (
+                        list(getattr(mmf, "data", {}).keys())
+                        if hasattr(mmf, "data") else "no .data"
+                    )
+                    print(
+                        f"[head-cascade] gather_mm rid={req_id} miss: "
+                        f"pv={pv is not None} thw={thw is not None} "
+                        f"data_keys={keys}", flush=True,
+                    )
                 continue
+            # image_grid_thw is sometimes stored as a 1D [3] tensor
+            # (per-image) and sometimes as [N, 3]. Target-ViT expects
+            # 2D rows; normalize here.
+            if thw.dim() == 1:
+                thw = thw.unsqueeze(0)
             pv_chunks.append(pv)
             thw_chunks.append(thw)
         if not pv_chunks:
@@ -5343,8 +5392,17 @@ class GPUModelRunner(
           target_vit_payloads_dict: req_id -> (cpu_image_embeds, cpu_grid_thw)
         """
         if self._cascade_score0_buf is None:
+            if os.environ.get("VLLM_HEAD_CASCADE_LOG_SCORES"):
+                print("[head-cascade] step skipped: score0_buf is None", flush=True)
             return {}, {}
         cascade_reqs = self.input_batch.head_cascade_reqs
+        if os.environ.get("VLLM_HEAD_CASCADE_LOG_SCORES"):
+            print(
+                f"[head-cascade] step: cascade_reqs={list(cascade_reqs)[:4]} "
+                f"req_ids={list(self.input_batch.req_ids)[:4]} "
+                f"sampled_lens={[len(v) for v in valid_sampled_token_ids[:4]]}",
+                flush=True,
+            )
         if not cascade_reqs:
             return {}, {}
 
@@ -5453,6 +5511,11 @@ class GPUModelRunner(
                 pv_list.append(pv)
                 thw_list.append(thw)
                 kept.append(rid)
+            if os.environ.get("VLLM_HEAD_CASCADE_LOG_SCORES"):
+                print(
+                    f"[head-cascade] encode_batch queued={cut0_reqs_for_encode} "
+                    f"kept={kept}", flush=True,
+                )
             if pv_list:
                 batch = (
                     self._target_vision.encode_async_batched_pre_processed(
