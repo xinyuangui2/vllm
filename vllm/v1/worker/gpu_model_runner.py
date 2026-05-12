@@ -3930,6 +3930,10 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            # paper_explore SYS1 head-cascade reads these in sample_tokens;
+            # ExecuteModelState was kept untouched to avoid wider ripples.
+            self._paper_explore_logits_indices = logits_indices
+            self._paper_explore_num_tokens_unpadded = num_tokens_unpadded
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -4157,6 +4161,10 @@ class GPUModelRunner(
                             hidden_states_dict[rid] = (
                                 last_token_hs[i].contiguous().clone()
                             )
+        # paper_explore SYS1: stash for sample_tokens which builds the
+        # ModelRunnerOutput. execute_model_state intentionally left
+        # untouched.
+        self._paper_explore_hidden_states_dict = hidden_states_dict
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4434,8 +4442,8 @@ class GPUModelRunner(
         cascade_decisions_dict, target_vit_payloads_dict = (
             self._run_head_cascade_step(
                 valid_sampled_token_ids,
-                logits_indices,
-                num_tokens_unpadded,
+                self._paper_explore_logits_indices,
+                self._paper_explore_num_tokens_unpadded,
             )
         )
 
@@ -4453,7 +4461,7 @@ class GPUModelRunner(
                 sampled_token_ids=valid_sampled_token_ids,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
-                hidden_states_dict=hidden_states_dict,
+                hidden_states_dict=self._paper_explore_hidden_states_dict,
                 cascade_decisions_dict=cascade_decisions_dict,
                 target_vit_payloads_dict=target_vit_payloads_dict,
                 kv_connector_output=kv_connector_output,
@@ -5082,7 +5090,9 @@ class GPUModelRunner(
         n_domains = len(domain_vocab)
         model, fwd = build_model_from_ckpt(ckpt, in_dim, n_domains)
         model.load_state_dict(ckpt["state_dict"])
-        model = model.to("cuda:0").eval()
+        # Cast to engine dtype so the head's matmuls match the
+        # decoder layer's hidden_states (bfloat16 in our setup).
+        model = model.to("cuda:0", dtype=self.dtype).eval()
         for p in model.parameters():
             p.requires_grad_(False)
         self._head_model = model
@@ -5377,6 +5387,11 @@ class GPUModelRunner(
                 src_idx_c0 = int(src_per_req[i])
                 self._stashed_score0[rid] = s00
                 self._stashed_src[rid] = src_idx_c0
+                if os.environ.get("VLLM_HEAD_CASCADE_LOG_SCORES"):
+                    print(
+                        f"[head-cascade] rid={rid} cut=0 s={s00:.6f} "
+                        f"src={src_idx_c0}", flush=True,
+                    )
                 # Head-gate the target-ViT encode: if cut-0 already
                 # passes τ_L1, the request will ship at cut-1 (OR-skip)
                 # regardless of s10, so target.regen will never be
@@ -5420,6 +5435,11 @@ class GPUModelRunner(
                     payload = self._consume_target_vit_payload(rid)
                     if payload is not None:
                         target_vit_payloads[rid] = payload
+                if os.environ.get("VLLM_HEAD_CASCADE_LOG_SCORES"):
+                    print(
+                        f"[head-cascade] rid={rid} cut=1 s={s10:.6f} "
+                        f"src={src_idx}", flush=True,
+                    )
 
         # Batched target-ViT dispatch for the step's cut-0 reqs.
         # ALWAYS fires (no head-gating) — see PR design notes.

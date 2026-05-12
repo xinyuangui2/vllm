@@ -461,7 +461,6 @@ class Qwen2Model(nn.Module, EagleModelMixin):
                     # last-position score post-forward via logits_indices,
                     # and chooses pos=0 score at cut-0 boundary / pos=1
                     # score at cut-1 boundary.
-                    fwd = self._paper_explore_head_forward
                     T = self._paper_explore_head_temperature
                     x0 = torch.cat(
                         [hidden_states, self._pos0_col[:n]], dim=-1,
@@ -469,8 +468,11 @@ class Qwen2Model(nn.Module, EagleModelMixin):
                     x1 = torch.cat(
                         [hidden_states, self._pos1_col[:n]], dim=-1,
                     )
-                    score0_logits, src_logits = fwd(cascade_head, x0)
-                    score1_logits, _ = fwd(cascade_head, x1)
+                    # Call the head directly: paper_explore heads
+                    # (multitask, MoE) both return 2 tensors from
+                    # forward — (score_logits, source_or_gate).
+                    score0_logits, src_logits = cascade_head(x0)
+                    score1_logits, _ = cascade_head(x1)
                     if score0_logits.dim() > 1:
                         score0_logits = score0_logits.squeeze(-1)
                         score1_logits = score1_logits.squeeze(-1)
