@@ -4315,7 +4315,22 @@ class GPUModelRunner(
             # step. logits_indices indexes into that range.
             captured = self._captured_hidden_states_buf[:num_tokens_unpadded]
             try:
-                # `non_blocking=False` on this GPU→CPU copy is load-bearing.
+                # `logits_indices` is sometimes on a different device than
+                # `captured` (CPU in some code paths, a different
+                # cuda:N alias in others). Force it onto the captured
+                # tensor's device before indexing — without this, the
+                # `captured[logits_indices]` raises a device-mismatch
+                # error which the outer try/except silently swallows,
+                # leaving hidden_states_dict empty for that step.
+                # Caught during Phase 4 of the SYS2 smoke: every step
+                # was failing this path on ~3-4k warnings per cell.
+                li = logits_indices
+                if (
+                    isinstance(li, torch.Tensor)
+                    and li.device != captured.device
+                ):
+                    li = li.to(captured.device)
+                # `non_blocking=False` on the GPU→CPU copy is load-bearing.
                 # The capture diagnostic in Phase 3 of the SYS2 smoke showed
                 # that with non_blocking=True, the FIRST yield's
                 # RequestOutput.hidden_states is a zero tensor for all but
@@ -4324,7 +4339,7 @@ class GPUModelRunner(
                 # CPU buffer, so the clone captured uninitialized memory
                 # (zeros). Cost of forcing the sync: ~50-200 µs per step,
                 # well below the noise floor of the per-step decode wall.
-                last_token_hs = captured[logits_indices].to(
+                last_token_hs = captured[li].to(
                     "cpu", non_blocking=False
                 )
             except Exception as e:  # pragma: no cover - defensive
