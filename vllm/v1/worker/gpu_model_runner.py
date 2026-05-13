@@ -5468,7 +5468,13 @@ class GPUModelRunner(
         self._target_vision = TargetVisionEncoder(
             target_model_id=self._target_vision_model_id,
             device=self.device,
-            dtype=torch.bfloat16,
+            # Match the engine's dtype so pre-encoded embeds drop into
+            # the target's LLM at its native precision. Previously
+            # hardcoded to bfloat16, which mismatched the target's
+            # float16 dtype and produced numerically drifted embeds
+            # — surfaced as degenerate REGEN responses
+            # (📐-emoji loops, immediate EOS) in SYS4 Phase B.
+            dtype=self.dtype,
             # Step B: dedicated stream so the encode's TP collectives
             # can overlap with the next main-forward step on the default
             # stream. NCCL ordering: all 4 ranks call collectives in the
