@@ -1666,6 +1666,37 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_SIMPLE_KV_OFFLOAD": lambda: bool(
         int(os.getenv("VLLM_USE_SIMPLE_KV_OFFLOAD", "0"))
     ),
+    # paper_explore SYS1 fork env vars. Registered here so they:
+    #   (1) stop emitting "Unknown vLLM environment variable" warnings;
+    #   (2) participate in the torch.compile / AOT cache hash
+    #       (`compile_factors()` iterates this dict). The hash must
+    #       discriminate runs with/without these vars set, otherwise
+    #       a cudagraph-mode baseline (no head, no extract) populates
+    #       the AOT cache with a no-head graph, and a subsequent head-
+    #       enabled run silently loads the no-head graph → cascade
+    #       fires nowhere, score buffers stay zero-init. (SYS5 root
+    #       cause, 2026-05-14.)
+    "VLLM_HEAD_CHECKPOINT_PATH": lambda: os.getenv(
+        "VLLM_HEAD_CHECKPOINT_PATH", None
+    ),
+    "VLLM_HEAD_TAU_TABLE_PATH": lambda: os.getenv(
+        "VLLM_HEAD_TAU_TABLE_PATH", None
+    ),
+    "VLLM_EXTRACT_HIDDEN_STATES_LAYER": lambda: os.getenv(
+        "VLLM_EXTRACT_HIDDEN_STATES_LAYER", None
+    ),
+    "VLLM_PAPER_EXPLORE_PATH": lambda: os.getenv(
+        "VLLM_PAPER_EXPLORE_PATH", None
+    ),
+    "VLLM_TARGET_VISION_MODEL_ID": lambda: os.getenv(
+        "VLLM_TARGET_VISION_MODEL_ID", None
+    ),
+    "VLLM_TARGET_VIT_MAX_BATCH": lambda: os.getenv(
+        "VLLM_TARGET_VIT_MAX_BATCH", None
+    ),
+    "VLLM_HEAD_CASCADE_LOG_SCORES": lambda: os.getenv(
+        "VLLM_HEAD_CASCADE_LOG_SCORES", None
+    ),
 }
 
 
@@ -1809,6 +1840,19 @@ def compile_factors() -> dict[str, object]:
         "LOCAL_RANK",
         "CUDA_VISIBLE_DEVICES",
         "NO_COLOR",
+        # paper_explore SYS1: registered above so they participate in
+        # __getattr__ / warning suppression, but these specific values
+        # don't affect the compiled forward graph — exclude from cache
+        # hashing so cache reuse isn't pessimized by every config
+        # difference (e.g., path-on-disk for paper_explore root,
+        # target-ViT batching knobs, logging toggles).
+        # The graph-affecting ones (VLLM_HEAD_CHECKPOINT_PATH,
+        # VLLM_HEAD_TAU_TABLE_PATH, VLLM_EXTRACT_HIDDEN_STATES_LAYER)
+        # stay OUT of this set — they MUST discriminate the cache.
+        "VLLM_PAPER_EXPLORE_PATH",
+        "VLLM_TARGET_VISION_MODEL_ID",
+        "VLLM_TARGET_VIT_MAX_BATCH",
+        "VLLM_HEAD_CASCADE_LOG_SCORES",
     }
 
     from vllm.config.utils import normalize_value

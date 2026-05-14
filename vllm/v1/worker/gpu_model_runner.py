@@ -3639,7 +3639,17 @@ class GPUModelRunner(
         logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
         logprobs_lists = None
-        if not self.use_async_scheduling:
+        # SYS5 Phase B: head_cascade needs valid_sampled_token_ids to
+        # be non-empty so `_run_head_cascade_step` can detect cut-0 /
+        # cut-1 boundaries per req. In pure-async mode without cascade,
+        # we keep the empty-list fast path; with cascade, we pay one
+        # D→H sync per step (cheap — `num_reqs` ints) to populate the
+        # list. Sync mode is unchanged.
+        materialize_sampled_ids = (
+            not self.use_async_scheduling
+            or bool(self.input_batch.head_cascade_reqs)
+        )
+        if materialize_sampled_ids:
             # Get the valid generated tokens.
             max_gen_len = sampled_token_ids.shape[-1]
             if max_gen_len == 1:
@@ -3661,6 +3671,8 @@ class GPUModelRunner(
                 )
         else:
             valid_sampled_token_ids = []
+
+        if self.use_async_scheduling:
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
             invalid_req_indices_set = set(invalid_req_indices)
 
