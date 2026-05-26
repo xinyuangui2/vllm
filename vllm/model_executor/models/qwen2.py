@@ -80,6 +80,39 @@ from .utils import (
 )
 
 
+# paper_explore SYS17δ: side-effectful copy that Inductor cannot
+# dead-code-eliminate. The fork's persistent buffer pattern relies on
+# writes inside the compiled `Qwen2Model.forward` being visible to
+# `execute_model` post-step. Plain `dst[:n].copy_(src)` gets eliminated
+# by Inductor because the read happens outside the compiled region —
+# the optimizer sees a write with no in-graph reader and drops it.
+# Marking this op with `mutates_args=["dst"]` tells the compiler the
+# op has externally-visible side effects and must be preserved.
+#
+# Diagnostic that pinned this: SYS17δ external-head probe under
+# graph_async produced score=0.501587 (sigmoid of zero) on ALL 100
+# records on the C18 5-source workload; eager produced 100 unique
+# scores spanning [0.009, 0.999] on the same inputs. Same root cause
+# as SYS17o's "ship rate collapse 64.4% → 18.7%" — the partial
+# survival rate matched the fraction of decode steps falling outside
+# captured cudagraph buckets, where Inductor's DCE didn't apply.
+@torch.library.custom_op(
+    "paper_explore::extract_copy",
+    mutates_args=("dst",),
+)
+def _paper_explore_extract_copy(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """Copy `src` into the leading rows of `dst`. Marked side-effectful."""
+    n = src.shape[0]
+    dst[:n].copy_(src)
+
+
+@_paper_explore_extract_copy.register_fake
+def _(dst: torch.Tensor, src: torch.Tensor) -> None:
+    # Inductor needs a meta impl to know the op produces no return
+    # tensor; the side effect on `dst` is declared via mutates_args.
+    return None
+
+
 class Qwen2MLP(nn.Module):
     def __init__(
         self,
@@ -453,8 +486,12 @@ class Qwen2Model(nn.Module, EagleModelMixin):
             if extract_buf is not None and idx == extract_layer_idx:
                 # Capture: write rows [0..num_tokens) of the buffer. The
                 # engine slices [:num_scheduled_tokens] post-forward.
+                # SYS17δ: route the write through a side-effectful custom
+                # op so Inductor preserves it across compilation; the
+                # post-step read in execute_model is invisible to Inductor
+                # and a plain `.copy_` gets dead-code-eliminated.
                 n = hidden_states.shape[0]
-                extract_buf[:n].copy_(hidden_states)
+                torch.ops.paper_explore.extract_copy(extract_buf, hidden_states)
                 if cascade_head is not None:
                     # Speculatively run head at pos_frac=0.0 AND pos_frac=1.0
                     # over ALL token positions. Engine picks the per-req
