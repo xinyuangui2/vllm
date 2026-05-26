@@ -528,14 +528,25 @@ class Qwen2Model(nn.Module, EagleModelMixin):
                     if score0_logits.dim() > 1:
                         score0_logits = score0_logits.squeeze(-1)
                         score1_logits = score1_logits.squeeze(-1)
-                    self._score0_buf[:n].copy_(
-                        torch.sigmoid(score0_logits.float() / T)
+                    # SYS17δ: same side-effectful-copy pattern as the
+                    # extract_buf write — Inductor DCE eliminates plain
+                    # `_score{0,1}_buf[:n].copy_(...)` because the read
+                    # happens in _run_head_cascade_step (post-step),
+                    # outside the compiled region. SYS17o's "ship rate
+                    # 64% → 19%" collapse was this DCE manifesting on
+                    # batch sizes outside captured cudagraph buckets.
+                    torch.ops.paper_explore.extract_copy(
+                        self._score0_buf,
+                        torch.sigmoid(score0_logits.float() / T),
                     )
-                    self._score1_buf[:n].copy_(
-                        torch.sigmoid(score1_logits.float() / T)
+                    torch.ops.paper_explore.extract_copy(
+                        self._score1_buf,
+                        torch.sigmoid(score1_logits.float() / T),
                     )
                     if src_logits is not None:
-                        self._src_buf[:n].copy_(src_logits.argmax(dim=-1))
+                        torch.ops.paper_explore.extract_copy(
+                            self._src_buf, src_logits.argmax(dim=-1),
+                        )
                     # else: single-task head — _src_buf left at zeros, all
                     # reqs map to source index 0 (engine falls back to
                     # τ_table["global"] if present).
