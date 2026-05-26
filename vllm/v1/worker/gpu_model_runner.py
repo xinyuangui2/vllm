@@ -3639,8 +3639,24 @@ class GPUModelRunner(
         logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
         logprobs_lists = None
-        if not self.use_async_scheduling:
-            # Get the valid generated tokens.
+        # SYS17δ (re-applying SYS5 Phase B): cascade head's
+        # _run_head_cascade_step needs valid_sampled_token_ids to be
+        # non-empty so `_is_cut0_for_req` / `_is_cut1_for_req` can
+        # detect boundaries. Under async_scheduling the default path
+        # leaves it empty (sync sampler not invoked), which causes
+        # head_decision to never get set → cascade requests fall
+        # through to direct-target dispatch (all REGEN).
+        #
+        # Force materialization when any request in the current batch
+        # opted into head_cascade. Pure-async non-cascade requests
+        # keep the fast empty-list path.
+        materialize_sampled_ids = (
+            not self.use_async_scheduling
+            or bool(self.input_batch.head_cascade_reqs)
+        )
+        invalid_req_indices_set: set[int] = set()
+        if materialize_sampled_ids:
+            # Get the valid generated tokens (sync materialization).
             max_gen_len = sampled_token_ids.shape[-1]
             if max_gen_len == 1:
                 # No spec decode tokens.
@@ -3659,11 +3675,19 @@ class GPUModelRunner(
                     discard_sampled_tokens_req_indices,
                     logprobs_tensors=logprobs_tensors,
                 )
+            if self.use_async_scheduling:
+                # Still need invalid_req_indices for the GPU bookkeeping
+                # block below.
+                invalid_req_indices = (
+                    discard_sampled_tokens_req_indices.tolist()
+                )
+                invalid_req_indices_set = set(invalid_req_indices)
         else:
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
             invalid_req_indices_set = set(invalid_req_indices)
 
+        if self.use_async_scheduling:
             # Cache the sampled tokens on the GPU and avoid CPU sync.
             # These will be copied into input_ids in the next step
             # when preparing inputs.
