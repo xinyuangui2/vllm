@@ -3,6 +3,7 @@
 """Mistral adaptation of the LLaMA architecture."""
 
 from collections.abc import Iterable
+from itertools import islice
 
 import torch
 from torch import nn
@@ -10,6 +11,7 @@ from transformers import LlamaConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
+from vllm.distributed import get_pp_group
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
@@ -222,9 +224,80 @@ class MistralModel(LlamaModel):
         inputs_embeds: torch.Tensor | None = None,
         t_cond: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
-        return super().forward(
-            input_ids, positions, intermediate_tensors, inputs_embeds, t_cond=t_cond
-        )
+        # paper_explore SYS21 (cascade-pixtral): port of the Qwen2 inline
+        # head hook to the Mistral text decoder used by Pixtral. Mirrors
+        # the structure in qwen2.Qwen2Model.forward — extract the targeted
+        # decoder layer's hidden states into a pre-allocated buffer and
+        # speculatively run the cascade head at pos_frac=0 / pos_frac=1.
+        # Pixtral-12B's Mistral-Nemo decoder is a standard Llama-style
+        # decoder (no cross-attn), so the port is structurally identical.
+        if get_pp_group().is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_input_ids(input_ids)
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = intermediate_tensors["residual"]
+
+        aux_hidden_states = self._maybe_add_hidden_state([], 0, hidden_states, residual)
+        extract_buf = getattr(self, "_paper_explore_extract_buf", None)
+        extract_layer_idx = getattr(self, "_paper_explore_extract_layer_idx", -1)
+        cascade_head = getattr(self, "_paper_explore_head", None)
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer)
+        ):
+            hidden_states, residual = layer(
+                positions, hidden_states, residual, t_cond=t_cond
+            )
+            if extract_buf is not None and idx == extract_layer_idx:
+                n = hidden_states.shape[0]
+                extract_buf[:n].copy_(hidden_states)
+                if cascade_head is not None:
+                    T = self._paper_explore_head_temperature
+                    if hasattr(cascade_head, "forward_pos0"):
+                        score0_logits, src_logits = cascade_head.forward_pos0(
+                            hidden_states
+                        )
+                        score1_logits, _ = cascade_head.forward_pos1(
+                            hidden_states
+                        )
+                    else:
+                        x0 = torch.cat(
+                            [hidden_states, self._pos0_col[:n]], dim=-1,
+                        )
+                        x1 = torch.cat(
+                            [hidden_states, self._pos1_col[:n]], dim=-1,
+                        )
+                        score0_logits, src_logits = cascade_head(x0)
+                        score1_logits, _ = cascade_head(x1)
+                    if score0_logits.dim() > 1:
+                        score0_logits = score0_logits.squeeze(-1)
+                        score1_logits = score1_logits.squeeze(-1)
+                    self._score0_buf[:n].copy_(
+                        torch.sigmoid(score0_logits.float() / T)
+                    )
+                    self._score1_buf[:n].copy_(
+                        torch.sigmoid(score1_logits.float() / T)
+                    )
+                    if src_logits is not None:
+                        self._src_buf[:n].copy_(src_logits.argmax(dim=-1))
+            self._maybe_add_hidden_state(
+                aux_hidden_states, idx + 1, hidden_states, residual
+            )
+
+        if not get_pp_group().is_last_rank:
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
+
+        hidden_states, _ = self.norm(hidden_states, residual)
+
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
 
 class MistralForCausalLM(LlamaForCausalLM):
