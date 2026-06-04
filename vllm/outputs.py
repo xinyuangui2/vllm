@@ -46,6 +46,17 @@ class CompletionOutput:
     finish_reason: str | None = None
     stop_reason: int | str | None = None
     lora_request: LoRARequest | None = None
+    # paper_explore SYS22 inline cascade-routing stats. Populated only
+    # when SamplingParams.emit_aggregate_logprob_stats=True at request
+    # submission. Aggregated inline by gpu_model_runner across all
+    # decoded steps:
+    #   mean_logprob:     mean chosen-token logprob across output
+    #   min_logprob:      minimum chosen-token logprob (worst step)
+    #   mean_max_prob:    mean of max-softmax over top-K per step
+    #   neg_mean_entropy: -mean of top-K predictive entropy per step
+    # Each is a single float; None if the request didn't opt in or
+    # generated zero tokens.
+    aggregate_logprob_stats: dict[str, float] | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -58,6 +69,7 @@ class CompletionOutput:
             f"routed_experts={self.routed_experts}, "
             f"cumulative_logprob={self.cumulative_logprob}, "
             f"logprobs={self.logprobs}, "
+            f"aggregate_logprob_stats={self.aggregate_logprob_stats}, "
             f"finish_reason={self.finish_reason}, "
             f"stop_reason={self.stop_reason})"
         )

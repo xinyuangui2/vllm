@@ -238,6 +238,14 @@ class SamplingParams(
     NOTE: GC costs of FlatLogprobs is significantly smaller than
     list[dict[int, Logprob]]. After enabled, PromptLogprobs and
     SampleLogprobs would populated as FlatLogprobs."""
+    emit_aggregate_logprob_stats: bool = False
+    """If True, emit per-request aggregate logprob statistics
+    (mean_logprob, min_logprob, mean_max_prob, neg_mean_entropy) in
+    RequestOutput. Computed inline during decoding without serializing
+    per-token logprobs to CPU. Used by paper_explore SYS22 cascade-
+    routing experiments. Requires `logprobs >= 2` for `mean_max_prob`
+    and `neg_mean_entropy`; with `logprobs == 1` only the chosen-token
+    stats (mean_logprob, min_logprob) are meaningful."""
     # NOTE: This parameter is only exposed at the engine level for now.
     # It is not exposed in the OpenAI API server, as the OpenAI API does
     # not support returning only a list of token IDs.
