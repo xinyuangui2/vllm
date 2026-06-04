@@ -119,9 +119,20 @@ cascade-prod-fixes branch.
 ## Status
 
 * ✅ schema patches: `sampling_params.py` field, `outputs.py` field
-* ⏳ TODO: per-step accumulator in gpu_model_runner
-* ⏳ TODO: scheduler/output_processor pass-through
-* ⏳ TODO: build worker image, run validation extract, compare vs
-   driver-side
+* ✅ per-request accumulator dataclass + engine-level registry
+   (`vllm/v1/cascade_lp_classifier.py`)
+* ✅ **driver-side reference implementation wired through
+   output_processor**: setting `emit_aggregate_logprob_stats=True`
+   today populates `CompletionOutput.aggregate_logprob_stats` from
+   the existing per-token `SampleLogprobs`. Same math as the inline
+   accumulator — useful as a numerical reference and lets
+   paper_explore exercise the API without waiting for the GPU-side
+   integration.
+* ⏳ TODO: per-step accumulator in gpu_model_runner (inline path —
+   avoids serializing per-token logprob dicts to CPU)
+* ⏳ TODO: build worker image, run paired extract, confirm inline
+   accumulator matches the driver-side reference within fp32
+   tolerance, then archive the legacy `cascade-prod-fixes` fork.
 
-Estimated remaining engineering: ~1-2 days for accumulator + tests.
+Estimated remaining engineering: ~1-2 days for the GPU-side
+accumulator + numerical-equivalence test.

@@ -29,9 +29,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
+
+if TYPE_CHECKING:
+    from vllm.logprobs import SampleLogprobs
 
 
 @dataclass
@@ -157,3 +160,81 @@ def update_accumulator_for_step(
         "_bookkeeping_sync is still TODO. See "
         "PAPER_EXPLORE_LP_CLASSIFIER_INLINE.md for the design."
     )
+
+
+# ---------------------------------------------------------------------
+# Driver-side reference implementation.
+#
+# Computes the same 4 stats as the inline accumulator, but from the
+# already-serialized SampleLogprobs (per-position dict[token_id ->
+# Logprob]). Same math, same outputs — just slower because it runs
+# after CPU serialization rather than inline.
+#
+# Two purposes:
+#   1. Numerical reference for validating the inline accumulator once
+#      gpu_model_runner integration lands.
+#   2. Lets paper_explore SYS22 cascade-routing exercise the new
+#      SamplingParams + CompletionOutput field today, before the full
+#      inline patch is wired up.
+# ---------------------------------------------------------------------
+
+def compute_aggregate_from_sample_logprobs(
+    logprobs: "SampleLogprobs",
+    token_ids: list[int],
+) -> dict[str, float] | None:
+    """Reference aggregator. Same math as PerRequestLogprobStats.
+
+    logprobs[i] is dict[token_id -> Logprob] for the i-th generated
+    position. token_ids[i] is the chosen token at that position.
+    """
+    if not logprobs or not token_ids:
+        return None
+
+    sum_chosen_lp = 0.0
+    min_chosen_lp = float("inf")
+    sum_max_prob = 0.0
+    sum_neg_entropy = 0.0
+    n_steps = 0
+
+    for pos, lp_dict in enumerate(logprobs):
+        if lp_dict is None or pos >= len(token_ids):
+            continue
+        chosen_tid = token_ids[pos]
+        chosen = lp_dict.get(chosen_tid)
+        if chosen is None:
+            continue
+        chosen_lp = float(chosen.logprob)
+        sum_chosen_lp += chosen_lp
+        if chosen_lp < min_chosen_lp:
+            min_chosen_lp = chosen_lp
+
+        # top-K logprobs at this position, sorted desc
+        topk_lps = sorted(
+            (float(v.logprob) for v in lp_dict.values()), reverse=True,
+        )
+        if not topk_lps:
+            continue
+        # mean_max_prob: top-1 softmax prob
+        sum_max_prob += math.exp(topk_lps[0])
+
+        # top-K entropy: renormalize over top-K
+        if len(topk_lps) > 1:
+            probs = [math.exp(lp) for lp in topk_lps]
+            z = sum(probs)
+            if z > 0:
+                normalized = [p / z for p in probs]
+                entropy = -sum(
+                    p * math.log(max(p, 1e-30)) for p in normalized
+                )
+                sum_neg_entropy += -entropy
+
+        n_steps += 1
+
+    if n_steps == 0:
+        return None
+    return {
+        "mean_logprob": sum_chosen_lp / n_steps,
+        "min_logprob": min_chosen_lp,
+        "mean_max_prob": sum_max_prob / n_steps,
+        "neg_mean_entropy": sum_neg_entropy / n_steps,
+    }

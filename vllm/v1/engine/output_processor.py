@@ -27,6 +27,9 @@ from vllm.tracing import (
     instrument_manual,
 )
 from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.v1.cascade_lp_classifier import (
+    compute_aggregate_from_sample_logprobs,
+)
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.detokenizer import IncrementalDetokenizer
 from vllm.v1.engine.logprobs import LogprobsProcessor
@@ -170,6 +173,15 @@ class RequestState:
         self.n = n
         self.temperature = temperature
         self.is_prefilling = True
+        # paper_explore SYS22 cascade-routing opt-in flag. Set by
+        # from_new_request when SamplingParams.emit_aggregate_logprob_stats
+        # is True. When the request finishes, the 4 aggregate stats are
+        # computed from the per-token logprobs and attached to
+        # CompletionOutput.aggregate_logprob_stats. Driver-side reference
+        # implementation — the truly-inline accumulator (skipping per-
+        # token CPU serialization) is the follow-up patch described in
+        # PAPER_EXPLORE_LP_CLASSIFIER_INLINE.md.
+        self.emit_aggregate_logprob_stats = False
         self.queue = queue
         self.num_cached_tokens = 0
 
@@ -243,7 +255,7 @@ class RequestState:
             output_kind = request.pooling_params.output_kind
 
         assert request.external_req_id is not None
-        return cls(
+        state = cls(
             request_id=request.request_id,
             external_req_id=request.external_req_id,
             parent_req=parent_req,
@@ -265,6 +277,15 @@ class RequestState:
             stream_interval=stream_interval,
             stream_input=request.resumable,
         )
+        # paper_explore SYS22 opt-in.
+        if (
+            request.sampling_params is not None
+            and getattr(
+                request.sampling_params, "emit_aggregate_logprob_stats", False,
+            )
+        ):
+            state.emit_aggregate_logprob_stats = True
+        return state
 
     def make_request_output(
         self,
@@ -395,6 +416,18 @@ class RequestState:
         if delta and logprobs:
             logprobs = logprobs[-len(token_ids) :]
 
+        # paper_explore SYS22 cascade-routing aggregate stats. Compute
+        # only at finalization (when the full per-token logprob sequence
+        # is in hand) to avoid wasted work on streaming intermediate
+        # outputs.
+        aggregate_logprob_stats = None
+        if finished and self.emit_aggregate_logprob_stats:
+            full_logprobs = self.logprobs_processor.logprobs
+            full_token_ids = self.detokenizer.output_token_ids
+            aggregate_logprob_stats = compute_aggregate_from_sample_logprobs(
+                full_logprobs, list(full_token_ids),
+            )
+
         return CompletionOutput(
             index=self.request_index,
             text=text,
@@ -404,6 +437,7 @@ class RequestState:
             cumulative_logprob=self.logprobs_processor.cumulative_logprob,
             finish_reason=str(finish_reason) if finished else None,
             stop_reason=stop_reason if finished else None,
+            aggregate_logprob_stats=aggregate_logprob_stats,
         )
 
     def _new_pooling_output(self, pooling_output: torch.Tensor) -> PoolingOutput:
