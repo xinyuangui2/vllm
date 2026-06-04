@@ -3391,11 +3391,20 @@ class GPUModelRunner(
         # (e.g. 1.4e-40, denormalized floats from uninitialized memory)
         # when this was non_blocking.
         lp_cpu = lp.detach().to("cpu").float()
+        # max-prob across the top-K row tells us whether this row was
+        # actually written by the sampler. For a prefilling request
+        # with no sample yet, the row is uninitialized memory —
+        # typically denormal floats with sum well below 0.5. A real
+        # softmax row has sum ≈ 1.0 (modulo tail truncation), so any
+        # row with sum < 0.01 is junk and we skip it.
+        row_sum_prob = torch.exp(lp_cpu).sum(dim=1)
         for req_idx in range(num_sampled_tokens):
             if req_idx in discard_set:
                 continue
             req_id = req_ids[req_idx]
             if req_id not in opted_in:
+                continue
+            if float(row_sum_prob[req_idx]) < 0.01:
                 continue
             chosen_lp = float(lp_cpu[req_idx, 0])
             topk_lp = lp_cpu[req_idx, 1:]  # [K]

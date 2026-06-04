@@ -121,18 +121,35 @@ cascade-prod-fixes branch.
 * ✅ schema patches: `sampling_params.py` field, `outputs.py` field
 * ✅ per-request accumulator dataclass + engine-level registry
    (`vllm/v1/cascade_lp_classifier.py`)
-* ✅ **driver-side reference implementation wired through
-   output_processor**: setting `emit_aggregate_logprob_stats=True`
-   today populates `CompletionOutput.aggregate_logprob_stats` from
-   the existing per-token `SampleLogprobs`. Same math as the inline
-   accumulator — useful as a numerical reference and lets
-   paper_explore exercise the API without waiting for the GPU-side
-   integration.
-* ⏳ TODO: per-step accumulator in gpu_model_runner (inline path —
-   avoids serializing per-token logprob dicts to CPU)
-* ⏳ TODO: build worker image, run paired extract, confirm inline
-   accumulator matches the driver-side reference within fp32
-   tolerance, then archive the legacy `cascade-prod-fixes` fork.
+* ✅ driver-side reference implementation wired through
+   `output_processor`. Production paper_explore uses this path: stable,
+   well-defined, identical to the existing per-token aggregation that
+   SYS22-T trained heads against.
+* ✅ GPU-side inline accumulator wired through
+   `gpu_model_runner._bookkeeping_sync` -> `ModelRunnerOutput
+   .aggregate_lp_stats_running` -> scheduler -> EngineCoreOutput ->
+   `output_processor` (prefers inline when present, falls back to
+   driver-side reference otherwise).
+* ✅ Numerical equivalence validated end-to-end on real Qwen2.5-VL-7B
+   inference: 8/8 C18 records (mathvista n=32, mmbench n=2, mmmu n=2,
+   docvqa n=8) match the driver-side reference within fp32 tolerance
+   (max delta 3.5e-9 to 2.4e-8, see
+   `paper_explore/scripts/sys22t_p17_test_inline_accumulator.py`).
 
-Estimated remaining engineering: ~1-2 days for the GPU-side
-accumulator + numerical-equivalence test.
+## Production path: driver-side (CPU)
+
+We use the **driver-side reference impl** in production. It runs after
+the per-token logprob dicts already exist in the engine driver, so it
+adds no GPU work and no new failure surface. CPU cost is negligible
+(~1 ms per request on the 2-layer transformer benchmark; aggregation
+itself is sub-microsecond).
+
+The inline (GPU-side) path saves the per-token-logprob CPU
+serialization, but the bookkeeping happens on TP rank 0 with a
+per-step synchronous CPU copy + a finite-row gate to skip
+prefill-only rows. For our workload that's not worth the additional
+gpu_model_runner / scheduler / engine schema surface.
+
+The inline patch is kept in the branch for future use (e.g., if we
+want to skip per-token serialization on streaming long-CoT requests),
+and the numerical-equivalence test is the gate for re-enabling it.
