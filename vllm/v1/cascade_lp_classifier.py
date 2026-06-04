@@ -54,6 +54,18 @@ class PerRequestLogprobStats:
         topk_logprobs: torch.Tensor,  # [K] sorted descending
     ) -> None:
         """Update from one decode step's outputs."""
+        # DEBUG instrumentation (paper_explore SYS22 P17 validation):
+        # print first call's tensor shape, dtype, and first few values
+        # to confirm correctness of the slice we're being handed.
+        import os
+        if os.environ.get("PAPER_EXPLORE_LP_DEBUG") == "1" and self.n_steps < 2:
+            print(
+                f"[lp_debug] chosen_logprob={chosen_logprob:.4f}  "
+                f"topk shape={tuple(topk_logprobs.shape)} dtype={topk_logprobs.dtype}  "
+                f"first5={topk_logprobs[:5].tolist()}  "
+                f"last5={topk_logprobs[-5:].tolist()}",
+                flush=True,
+            )
         self.sum_chosen_logprob += chosen_logprob
         if chosen_logprob < self.min_chosen_logprob:
             self.min_chosen_logprob = chosen_logprob
