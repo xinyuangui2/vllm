@@ -235,6 +235,15 @@ class InputBatch:
 
         self.num_logprobs: dict[str, int] = {}
 
+        # paper_explore SYS22 cascade-routing inline aggregate logprob
+        # stats. Set of request ids that opted in via
+        # SamplingParams.emit_aggregate_logprob_stats. gpu_model_runner
+        # updates the per-request accumulator each decode step for
+        # these requests; the 4-stat aggregate flows out via
+        # EngineCoreOutput when the request finishes. See
+        # PAPER_EXPLORE_LP_CLASSIFIER_INLINE.md.
+        self.emit_aggregate_logprob_stats: set[str] = set()
+
         # To accumulate prompt logprobs tensor chunks across prefill steps.
         self.in_progress_prompt_logprobs_cpu: dict[str, LogprobsTensors] = {}
 
@@ -395,6 +404,14 @@ class InputBatch:
                     else sampling_params.logprobs
                 )
 
+            # paper_explore SYS22: track per-request opt-in for inline
+            # aggregate stats. Requires logprobs >= 1 (else the sampler
+            # won't emit logprobs_tensors and the accumulator has
+            # nothing to consume).
+            if getattr(sampling_params, "emit_aggregate_logprob_stats",
+                       False):
+                self.emit_aggregate_logprob_stats.add(req_id)
+
             if sampling_params.allowed_token_ids:
                 self.has_allowed_token_ids.add(req_id)
                 if self.allowed_token_ids_mask_cpu_tensor is None:
@@ -523,6 +540,7 @@ class InputBatch:
         self.generators.pop(req_index, None)
         self.num_logprobs.pop(req_id, None)
         self.in_progress_prompt_logprobs_cpu.pop(req_id, None)
+        self.emit_aggregate_logprob_stats.discard(req_id)
         if self.prev_req_id_to_index is not None:
             self.prev_req_id_to_index.pop(req_id, None)
 

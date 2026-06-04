@@ -165,6 +165,14 @@ class EngineCoreOutput(
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
+    # paper_explore SYS22 inline cascade-routing stats. Populated per
+    # step when SamplingParams.emit_aggregate_logprob_stats=True at
+    # request submission. Layout (5 floats):
+    #   (sum_chosen_lp, min_chosen_lp, sum_max_prob,
+    #    sum_neg_entropy, n_steps)
+    # Output processor accumulates running totals across steps and
+    # finalizes (divides by n_steps) at request completion.
+    aggregate_lp_stats_running: tuple[float, float, float, float, int] | None = None
 
     @property
     def finished(self) -> bool:

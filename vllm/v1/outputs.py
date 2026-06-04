@@ -250,6 +250,18 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
+    # paper_explore SYS22 inline cascade-routing accumulator state.
+    # req_id -> (sum_chosen_lp, min_chosen_lp, sum_max_prob,
+    #            sum_neg_entropy, n_steps)
+    # Populated by gpu_model_runner each step for requests that opted
+    # in via SamplingParams.emit_aggregate_logprob_stats. The scheduler
+    # plumbs these through EngineCoreOutput.aggregate_lp_stats_running;
+    # output_processor finalizes (divide-by-n_steps) at request
+    # completion. Same 4 final stats as the driver-side reference.
+    aggregate_lp_stats_running: (
+        dict[str, tuple[float, float, float, float, int]] | None
+    ) = None
+
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 

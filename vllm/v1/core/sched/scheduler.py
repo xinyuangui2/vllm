@@ -1307,6 +1307,10 @@ class Scheduler(SchedulerInterface):
         sampled_token_ids = model_runner_output.sampled_token_ids
         logprobs = model_runner_output.logprobs
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+        # paper_explore SYS22 inline cascade-routing accumulator state.
+        aggregate_lp_stats_running = (
+            model_runner_output.aggregate_lp_stats_running
+        )
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
@@ -1454,6 +1458,12 @@ class Scheduler(SchedulerInterface):
                 or kv_transfer_params
                 or stopped
             ):
+                # paper_explore SYS22: include accumulator state if opted in.
+                agg_lp_running = (
+                    aggregate_lp_stats_running.get(req_id)
+                    if aggregate_lp_stats_running is not None
+                    else None
+                )
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -1471,6 +1481,7 @@ class Scheduler(SchedulerInterface):
                         num_external_computed_tokens=request.num_external_computed_tokens,
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
+                        aggregate_lp_stats_running=agg_lp_running,
                     )
                 )
             else:

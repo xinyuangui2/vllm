@@ -285,6 +285,10 @@ class RequestState:
             )
         ):
             state.emit_aggregate_logprob_stats = True
+        # Running accumulator state from gpu_model_runner; populated
+        # only when the inline (GPU-side) path emits it. Driver-side
+        # reference is used as fallback if this stays None.
+        state.aggregate_lp_stats_running = None
         return state
 
     def make_request_output(
@@ -416,17 +420,31 @@ class RequestState:
         if delta and logprobs:
             logprobs = logprobs[-len(token_ids) :]
 
-        # paper_explore SYS22 cascade-routing aggregate stats. Compute
-        # only at finalization (when the full per-token logprob sequence
-        # is in hand) to avoid wasted work on streaming intermediate
-        # outputs.
+        # paper_explore SYS22 cascade-routing aggregate stats. Two
+        # paths:
+        # (1) inline: gpu_model_runner accumulated per-step. We
+        #     received running totals via aggregate_lp_stats_running;
+        #     just divide-by-n_steps at completion.
+        # (2) driver-side fallback: compute from the already-
+        #     serialized SampleLogprobs (same math, slower path).
         aggregate_logprob_stats = None
         if finished and self.emit_aggregate_logprob_stats:
-            full_logprobs = self.logprobs_processor.logprobs
-            full_token_ids = self.detokenizer.output_token_ids
-            aggregate_logprob_stats = compute_aggregate_from_sample_logprobs(
-                full_logprobs, list(full_token_ids),
-            )
+            running = self.aggregate_lp_stats_running
+            if running is not None:
+                sum_lp, min_lp, sum_max_p, sum_neg_ent, n = running
+                if n > 0:
+                    aggregate_logprob_stats = {
+                        "mean_logprob": sum_lp / n,
+                        "min_logprob": min_lp,
+                        "mean_max_prob": sum_max_p / n,
+                        "neg_mean_entropy": sum_neg_ent / n,
+                    }
+            if aggregate_logprob_stats is None:
+                full_logprobs = self.logprobs_processor.logprobs
+                full_token_ids = self.detokenizer.output_token_ids
+                aggregate_logprob_stats = compute_aggregate_from_sample_logprobs(
+                    full_logprobs, list(full_token_ids),
+                )
 
         return CompletionOutput(
             index=self.request_index,
@@ -653,6 +671,14 @@ class OutputProcessor:
             routed_experts = engine_core_output.routed_experts
             req_state.num_cached_tokens = engine_core_output.num_cached_tokens
             req_state.is_prefilling = False
+
+            # paper_explore SYS22: stash latest running accumulator
+            # state for opted-in requests. Finalized at completion in
+            # _new_completion_output.
+            if engine_core_output.aggregate_lp_stats_running is not None:
+                req_state.aggregate_lp_stats_running = (
+                    engine_core_output.aggregate_lp_stats_running
+                )
 
             if pooling_output is None:
                 assert req_state.detokenizer is not None

@@ -637,6 +637,17 @@ class GPUModelRunner(
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
 
+        # paper_explore SYS22 inline cascade-routing accumulator. Updated
+        # in _bookkeeping_sync each decode step for requests that opted
+        # in via SamplingParams.emit_aggregate_logprob_stats. The 4
+        # finalized stats flow out via the per-request finished-stats
+        # dict at request completion. See PAPER_EXPLORE_LP_CLASSIFIER_INLINE.md.
+        from vllm.v1.cascade_lp_classifier import LogprobStatsAccumulator
+        self._lp_stats_accumulator = LogprobStatsAccumulator()
+        # Finalized stats indexed by request id; drained by the engine
+        # when constructing EngineCoreOutput.
+        self._lp_stats_finalized: dict[str, dict[str, float]] = {}
+
         # Separate cuda stream for overlapping transfer of sampled token ids from
         # GPU to CPU when async scheduling is enabled.
         self.async_output_copy_stream: torch.cuda.Stream | None = None
@@ -3346,6 +3357,43 @@ class GPUModelRunner(
         )
         return sampler_output
 
+    def _update_lp_stats_accumulator_step(
+        self,
+        logprobs_tensors: "LogprobsTensors",
+        num_sampled_tokens: int,
+        discard_indices: np.ndarray,
+    ) -> None:
+        """paper_explore SYS22 per-step accumulator update.
+
+        For each opted-in request that produced a valid sampled token
+        this step, update the per-request running stats with the
+        chosen-token logprob and the step's top-K logprobs.
+        """
+        # CPU sync at this point is a real cost. We pay it because the
+        # accumulator state is per-request and tiny — alternative is
+        # per-engine GPU buffers indexed by req_idx with a single async
+        # copy per step. That's the next optimization; for correctness
+        # we do per-step CPU sync first.
+        # The logprobs row layout from
+        # Sampler.gather_logprobs is [chosen_lp, top1_lp, ..., topK_lp].
+        lp = logprobs_tensors.logprobs  # [num_sampled_tokens, K+1]
+        discard_set = set(discard_indices.tolist())
+        req_ids = self.input_batch.req_ids
+        opted_in = self.input_batch.emit_aggregate_logprob_stats
+        # Snapshot CPU copy once per step (avoids per-request .cpu()
+        # round-trips when many requests are opted in).
+        lp_cpu = lp.detach().to("cpu", non_blocking=True).float()
+        for req_idx in range(num_sampled_tokens):
+            if req_idx in discard_set:
+                continue
+            req_id = req_ids[req_idx]
+            if req_id not in opted_in:
+                continue
+            chosen_lp = float(lp_cpu[req_idx, 0])
+            topk_lp = lp_cpu[req_idx, 1:]  # [K]
+            self._lp_stats_accumulator.register_request(req_id)
+            self._lp_stats_accumulator.update(req_id, chosen_lp, topk_lp)
+
     def _bookkeeping_sync(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3385,6 +3433,23 @@ class GPUModelRunner(
         sampled_token_ids = sampler_output.sampled_token_ids
         logprobs_tensors = sampler_output.logprobs_tensors
         invalid_req_indices = []
+
+        # paper_explore SYS22: per-step inline accumulator update.
+        # Layout of logprobs_tensors (vllm/v1/sample/sampler.py):
+        #   logprobs[row, 0]    = chosen-token logprob at this step
+        #   logprobs[row, 1:K+1] = top-K logprobs (sorted desc)
+        # For max_gen_len==1 (no spec decode) row == req_idx in
+        # input_batch. We skip the spec-decode case for now — SYS22-T
+        # cascade routing doesn't use spec decode at the draft tier.
+        if (
+            logprobs_tensors is not None
+            and self.input_batch.emit_aggregate_logprob_stats
+            and sampled_token_ids.shape[-1] == 1
+        ):
+            self._update_lp_stats_accumulator_step(
+                logprobs_tensors, num_sampled_tokens,
+                discard_sampled_tokens_req_indices,
+            )
         logprobs_lists = None
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
@@ -4314,6 +4379,26 @@ class GPUModelRunner(
                 else:
                     logger.error("RoutedExpertsCapturer not initialized.")
 
+            # paper_explore SYS22: snapshot the running accumulator
+            # state for opted-in requests so the scheduler can plumb
+            # them through EngineCoreOutput. Cheap (5 floats per req).
+            agg_lp = None
+            if self.input_batch.emit_aggregate_logprob_stats:
+                agg_lp = {}
+                # pylint: disable=protected-access
+                state_dict = self._lp_stats_accumulator._state
+                for rid in self.input_batch.emit_aggregate_logprob_stats:
+                    st = state_dict.get(rid)
+                    if st is None or st.n_steps == 0:
+                        continue
+                    agg_lp[rid] = (
+                        st.sum_chosen_logprob,
+                        st.min_chosen_logprob,
+                        st.sum_max_prob,
+                        st.sum_neg_entropy,
+                        st.n_steps,
+                    )
+
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -4325,6 +4410,7 @@ class GPUModelRunner(
                 if self.supports_mm_inputs
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
+                aggregate_lp_stats_running=agg_lp,
                 cudagraph_stats=cudagraph_stats,
             )
 
