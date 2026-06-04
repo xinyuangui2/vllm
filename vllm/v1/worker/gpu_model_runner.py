@@ -3376,13 +3376,21 @@ class GPUModelRunner(
         # we do per-step CPU sync first.
         # The logprobs row layout from
         # Sampler.gather_logprobs is [chosen_lp, top1_lp, ..., topK_lp].
+        # Bookkeeping runs on TP rank 0 only (the rank that constructs
+        # the ModelRunnerOutput consumed by the scheduler). Other ranks
+        # do not need to populate the accumulator. The early-return is
+        # explicit below.
+        if get_tp_group().rank_in_group != 0:
+            return
         lp = logprobs_tensors.logprobs  # [num_sampled_tokens, K+1]
         discard_set = set(discard_indices.tolist())
         req_ids = self.input_batch.req_ids
         opted_in = self.input_batch.emit_aggregate_logprob_stats
-        # Snapshot CPU copy once per step (avoids per-request .cpu()
-        # round-trips when many requests are opted in).
-        lp_cpu = lp.detach().to("cpu", non_blocking=True).float()
+        # Synchronous CPU copy — non_blocking races with downstream
+        # reads of lp_cpu. The 4xA10G validation showed garbage values
+        # (e.g. 1.4e-40, denormalized floats from uninitialized memory)
+        # when this was non_blocking.
+        lp_cpu = lp.detach().to("cpu").float()
         for req_idx in range(num_sampled_tokens):
             if req_idx in discard_set:
                 continue
