@@ -187,6 +187,11 @@ class RequestState:
         # [chosen_lp, max_p, neg_entropy]; we extend the 3 lists across
         # steps and finalize to [T, 4] (with pos_frac) at request end.
         self.emit_per_token_feature_seq = False
+        # paper_explore SYS25 Phase 4 — in-engine cascade head opt-in.
+        # Set by from_new_request when SamplingParams.in_engine_cascade_head
+        # is True. cascade_source is plumbed for per-source τ lookup.
+        self.in_engine_cascade_head = False
+        self.cascade_source: str | None = None
         self.queue = queue
         self.num_cached_tokens = 0
 
@@ -306,6 +311,20 @@ class RequestState:
         # lists (chosen_lp, max_p, neg_entropy) that we extend across
         # steps and reshape to [T, 4] at finalize.
         state.per_token_feature_seq_running = None
+        # paper_explore SYS25 Phase 4 — in-engine cascade head opt-in.
+        # Setting in_engine_cascade_head=True implicitly enables
+        # emit_per_token_feature_seq (the head consumes that signal).
+        if (
+            request.sampling_params is not None
+            and getattr(
+                request.sampling_params, "in_engine_cascade_head", False,
+            )
+        ):
+            state.in_engine_cascade_head = True
+            state.emit_per_token_feature_seq = True
+            state.cascade_source = getattr(
+                request.sampling_params, "cascade_source", None,
+            )
         return state
 
     def make_request_output(
@@ -495,6 +514,24 @@ class RequestState:
                     full_logprobs, list(full_token_ids),
                 )
 
+        # paper_explore SYS25 Phase 4 — in-engine cascade gate forward.
+        # When the request opted in AND the engine was booted with the
+        # head's env-var ckpts, run attn_pool on the per-token features
+        # here and attach the SHIP/REGEN verdict. Single engine call
+        # returns text AND routing decision.
+        head_decision = None
+        if (
+            finished
+            and self.in_engine_cascade_head
+            and per_token_features is not None
+        ):
+            from vllm.v1.cascade_lp_classifier import get_in_engine_head
+            head = get_in_engine_head()
+            if head is not None:
+                head_decision = head.decide(
+                    per_token_features, self.cascade_source,
+                )
+
         return CompletionOutput(
             index=self.request_index,
             text=text,
@@ -506,6 +543,7 @@ class RequestState:
             stop_reason=stop_reason if finished else None,
             aggregate_logprob_stats=aggregate_logprob_stats,
             per_token_features=per_token_features,
+            head_decision=head_decision,
         )
 
     def _new_pooling_output(self, pooling_output: torch.Tensor) -> PoolingOutput:

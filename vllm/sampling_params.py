@@ -256,6 +256,19 @@ class SamplingParams(
     driver. Requires `logprobs >= 2` (mirrors emit_aggregate_logprob_stats);
     with smaller K, `max_p` and `neg_entropy` are computed over the
     available top-K only."""
+    in_engine_cascade_head: bool = False
+    """SYS25 Phase 4 — If True AND the engine was booted with env vars
+    VLLM_CASCADE_ATTN_POOL_{CKPT,TAU}, run the loaded attn_pool head on
+    the request's per-token features at end-of-sequence and attach the
+    SHIP/REGEN verdict to CompletionOutput.head_decision. Brings the
+    cascade gate inside the engine — a single engine.generate() call
+    returns both the text AND the routing decision. Implicitly enables
+    emit_per_token_feature_seq."""
+    cascade_source: str | None = None
+    """SYS25 Phase 4 — Optional source/benchmark family identifier used
+    to look up the per-source τ from the loaded tau table when
+    in_engine_cascade_head=True. If None or not in the table, falls back
+    to the global τ."""
     # NOTE: This parameter is only exposed at the engine level for now.
     # It is not exposed in the OpenAI API server, as the OpenAI API does
     # not support returning only a list of token IDs.

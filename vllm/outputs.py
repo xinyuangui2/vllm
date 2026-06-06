@@ -64,6 +64,16 @@ class CompletionOutput:
     # per-token gate (attn_pool / transformer_L2) — saves the per-step
     # Logprob-dict construction the standard `logprobs=K` path pays.
     per_token_features: list[list[float]] | None = None
+    # paper_explore SYS25 Phase 4 — in-engine attn_pool gate decision.
+    # Populated only when SamplingParams.in_engine_cascade_head=True and
+    # the engine was booted with VLLM_CASCADE_ATTN_POOL_{CKPT,TAU} env
+    # vars pointing at a trained head + τ table. A dict:
+    #   {"verdict": "SHIP"|"REGEN", "score": float, "tau": float,
+    #    "source": str|None}
+    # Lets engine.generate(...) return BOTH the text AND the routing
+    # decision in a single call — the paper-clean "draft + gate as one
+    # model" architecture. Equivalent to the driver-side gate forward.
+    head_decision: dict | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None

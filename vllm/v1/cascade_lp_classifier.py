@@ -388,3 +388,136 @@ def compute_aggregate_from_sample_logprobs(
         "mean_max_prob": sum_max_prob / n_steps,
         "neg_mean_entropy": sum_neg_entropy / n_steps,
     }
+
+
+# ============================================================
+# SYS25 Phase 4 — in-engine attn_pool head forward.
+# Loaded once per OutputProcessor lifetime from env vars; fired
+# at end-of-sequence from RequestState._new_completion_output.
+# Brings the gate inside the engine so a single engine.generate
+# call returns both the text and the SHIP/REGEN decision —
+# eliminates the "engine emits logprobs → driver-side gate"
+# split that the paper draft would otherwise have to explain.
+# ============================================================
+
+
+class _InEngineAttnPool(torch.nn.Module):
+    """Mirror of paper_explore/scripts/sys22t_p16b_train_seq_models.py
+    AttnPool. Replicated here so vLLM doesn't need to import the
+    paper_explore module at engine init."""
+
+    def __init__(self, n_features: int = 4, d_model: int = 64):
+        super().__init__()
+        self.proj = torch.nn.Linear(n_features, d_model)
+        self.query = torch.nn.Parameter(torch.randn(d_model))
+        self.classifier = torch.nn.Linear(d_model, 1)
+
+    def forward(self, x: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
+        h = self.proj(x)
+        scores = (h * self.query).sum(dim=-1)
+        T = scores.shape[1]
+        mask = (torch.arange(T, device=x.device).unsqueeze(0)
+                < lens.to(x.device).unsqueeze(1))
+        scores = scores.masked_fill(~mask, -1e9)
+        attn = torch.nn.functional.softmax(scores, dim=1).unsqueeze(-1)
+        pooled = (h * attn).sum(dim=1)
+        return self.classifier(pooled).squeeze(-1)
+
+
+class InEngineAttnPoolHead:
+    """Phase 4 in-engine cascade gate. Loaded once per OutputProcessor;
+    decides SHIP/REGEN from the per-token feature seq at end of sequence.
+
+    Decision: sigmoid(model(feature_seq)) >= τ[source] → SHIP else REGEN.
+    Same arithmetic as paper_explore/glue/gate.py:transformer_seq_gate.
+    """
+
+    def __init__(self, ckpt_path: str, tau_table_path: str) -> None:
+        import json as _json
+        ckpt = torch.load(ckpt_path, weights_only=False,
+                          map_location="cpu")
+        hp = ckpt["hparams"]
+        if hp.get("arch") != "AttnPool":
+            raise ValueError(
+                f"InEngineAttnPoolHead expects arch=AttnPool, got "
+                f"{hp.get('arch')!r}"
+            )
+        self.model = _InEngineAttnPool(
+            n_features=int(hp.get("n_features", 4)),
+            d_model=int(hp.get("d_model", 64)),
+        )
+        self.model.load_state_dict(ckpt["state_dict"])
+        self.model.eval()
+        with open(tau_table_path) as _f:
+            self.tau_table = _json.load(_f)
+        self.global_tau = float(
+            (self.tau_table.get("global") or {}).get("tau", 0.5)
+        )
+        self.per_source = self.tau_table.get("per_source", {}) or {}
+        # Warmup so first inference doesn't pay PyTorch dispatch JIT cost
+        with torch.inference_mode():
+            _ = self.model(torch.zeros(1, 8, hp.get("n_features", 4)),
+                           torch.tensor([8]))
+
+    def tau_for(self, source: str | None) -> float:
+        if source and source in self.per_source:
+            return float(
+                self.per_source[source].get("best", {}).get(
+                    "tau", self.global_tau,
+                )
+            )
+        return self.global_tau
+
+    def decide(
+        self,
+        feature_seq: list[list[float]] | None,
+        source: str | None,
+    ) -> dict[str, Any] | None:
+        if not feature_seq:
+            return {"verdict": "REGEN", "score": None,
+                    "tau": self.global_tau, "reason": "no_features"}
+        x = torch.tensor([feature_seq], dtype=torch.float32)
+        lens = torch.tensor([x.shape[1]])
+        with torch.inference_mode():
+            logit = self.model(x, lens)
+        score = float(torch.sigmoid(logit).item())
+        tau = self.tau_for(source)
+        return {
+            "verdict": "SHIP" if score >= tau else "REGEN",
+            "score": score,
+            "tau": tau,
+            "source": source,
+        }
+
+
+# Singleton — loaded on first access, reused for all requests in the
+# engine's lifetime. Env vars:
+#   VLLM_CASCADE_ATTN_POOL_CKPT  — path to attn_pool.pt
+#   VLLM_CASCADE_ATTN_POOL_TAU   — path to tau-table .json
+_HEAD_SINGLETON: "InEngineAttnPoolHead | None" = None
+_HEAD_INIT_TRIED: bool = False
+
+
+def get_in_engine_head() -> "InEngineAttnPoolHead | None":
+    global _HEAD_SINGLETON, _HEAD_INIT_TRIED
+    if _HEAD_SINGLETON is not None or _HEAD_INIT_TRIED:
+        return _HEAD_SINGLETON
+    _HEAD_INIT_TRIED = True
+    import os as _os
+    import logging as _logging
+    ckpt = _os.environ.get("VLLM_CASCADE_ATTN_POOL_CKPT")
+    tau = _os.environ.get("VLLM_CASCADE_ATTN_POOL_TAU")
+    if not ckpt or not tau:
+        return None
+    try:
+        _HEAD_SINGLETON = InEngineAttnPoolHead(ckpt, tau)
+        _logging.getLogger(__name__).info(
+            "[SYS25 Phase 4] Loaded in-engine cascade attn_pool head "
+            "from ckpt=%s tau=%s", ckpt, tau,
+        )
+    except Exception as e:  # noqa: BLE001
+        _logging.getLogger(__name__).warning(
+            "[SYS25 Phase 4] Failed to load in-engine head: %s", e,
+        )
+        _HEAD_SINGLETON = None
+    return _HEAD_SINGLETON
