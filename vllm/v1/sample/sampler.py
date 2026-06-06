@@ -77,7 +77,14 @@ class Sampler(nn.Module):
         # This is different from the V0 sampler, which uses the logits that
         # is used for sampling (after penalties and temperature scaling).
         num_logprobs = sampling_metadata.max_num_logprobs
-        if num_logprobs is not None:
+        # paper_explore SYS25 Phase 3 — when any request opts in via
+        # SamplingParams.emit_per_token_feature_seq, the sampler needs
+        # log_softmax to compute the [chosen_lp, max_p, neg_entropy]
+        # feature row, even if no driver-visible logprobs are requested.
+        needs_feature_seq = bool(
+            getattr(sampling_metadata, "has_emit_per_token_feature_seq", False)
+        )
+        if num_logprobs is not None or needs_feature_seq:
             if logprobs_mode == "raw_logprobs":
                 raw_logprobs = self.compute_logprobs(logits)
             elif logprobs_mode == "raw_logits":
@@ -102,6 +109,28 @@ class Sampler(nn.Module):
         # return int32 (while PyTorch argmax and topk return int64).
         sampled = sampled.long()
 
+        # paper_explore SYS25 Phase 3 — compute features inline from
+        # log_softmax(logits). All reductions are vectorized over the
+        # batch dim; output is a [B, 3] tensor (chosen_lp, max_p,
+        # neg_entropy). Skips gather_logprobs entirely when only
+        # feature_seq is needed (no topk, no rank).
+        feature_seq_tensor = None
+        if needs_feature_seq:
+            # raw_logprobs is [B, V] log_softmax. sampled is [B].
+            chosen_lp = raw_logprobs.gather(
+                -1, sampled.unsqueeze(-1)
+            ).squeeze(-1)
+            max_lp = raw_logprobs.amax(dim=-1)
+            max_p = torch.exp(max_lp)
+            # Full-distribution entropy: H = -sum(p * log_p).
+            # log_p == raw_logprobs (already log_softmax).
+            p = torch.exp(raw_logprobs)
+            entropy = -(p * raw_logprobs).sum(dim=-1)
+            neg_entropy = -entropy  # higher = more confident
+            feature_seq_tensor = torch.stack(
+                [chosen_lp, max_p, neg_entropy], dim=-1
+            )  # [B, 3]
+
         if num_logprobs is None:
             logprobs_tensors = None
         elif num_logprobs == -1:
@@ -125,6 +154,7 @@ class Sampler(nn.Module):
             # token per request.
             sampled_token_ids=sampled.unsqueeze(-1),
             logprobs_tensors=logprobs_tensors,
+            feature_seq_tensor=feature_seq_tensor,
         )
         return sampler_output
 

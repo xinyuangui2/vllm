@@ -410,20 +410,11 @@ class InputBatch:
                     if sampling_params.logprobs == -1
                     else sampling_params.logprobs
                 )
-            # paper_explore SYS25 — when emit_per_token_feature_seq=True
-            # but the user didn't request driver-visible logprobs, the
-            # sampler still needs to emit logprobs_tensors so the
-            # FeatureSeqAccumulator hook can read the top-K row. Force
-            # num_logprobs=K_DEFAULT (small) for these requests. Users
-            # who DO want driver-visible logprobs (logprobs=K) take the
-            # branch above and don't fall into this one.
-            elif getattr(
-                sampling_params, "emit_per_token_feature_seq", False,
-            ):
-                # K=20 keeps the top-K entropy estimate consistent with
-                # the SYS22-T training default; smaller K would also
-                # work but changes the feature distribution.
-                self.num_logprobs[req_id] = 20
+            # paper_explore SYS25 Phase 3 — no longer force num_logprobs
+            # for feature_seq requests. The sampler now computes features
+            # directly from log_softmax (independent of gather_logprobs)
+            # so we skip the K+1 indices/logprobs path entirely when only
+            # feature_seq is needed.
 
             # paper_explore SYS22: track per-request opt-in for inline
             # aggregate stats. Requires logprobs >= 1 (else the sampler
@@ -926,6 +917,10 @@ class InputBatch:
             allowed_token_ids_mask=allowed_token_ids_mask,
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
+            # paper_explore SYS25 Phase 3
+            has_emit_per_token_feature_seq=bool(
+                self.emit_per_token_feature_seq
+            ),
         )
 
     def get_pooling_params(self) -> list[PoolingParams]:

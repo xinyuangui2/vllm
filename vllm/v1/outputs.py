@@ -123,6 +123,11 @@ class SamplerOutput:
     # PLACEHOLDER_TOKEN_ID (-1 by default) is used for padding.
     sampled_token_ids: torch.Tensor
     logprobs_tensors: LogprobsTensors | None
+    # paper_explore SYS25 Phase 3 — per-step feature row computed
+    # inline from log_softmax(logits). Shape [num_reqs, 3]:
+    # (chosen_lp, max_p, neg_entropy) per row. None when no request
+    # opted in via SamplingParams.emit_per_token_feature_seq.
+    feature_seq_tensor: torch.Tensor | None = None
 
 
 T = TypeVar("T")

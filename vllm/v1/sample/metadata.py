@@ -42,3 +42,11 @@ class SamplingMetadata:
 
     # Speculative token ids
     spec_token_ids: list[list[int]] | None = None
+
+    # paper_explore SYS25 Phase 3 — True if any request in the batch
+    # opted in via SamplingParams.emit_per_token_feature_seq. When set,
+    # the sampler computes [chosen_lp, max_p, neg_entropy] inline from
+    # log_softmax(logits) and emits SamplerOutput.feature_seq_tensor.
+    # Independent of max_num_logprobs so feature_seq can run without
+    # paying for gather_logprobs (topk + rank).
+    has_emit_per_token_feature_seq: bool = False

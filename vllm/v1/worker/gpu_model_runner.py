@@ -3392,7 +3392,6 @@ class GPUModelRunner(
         discard_set = set(discard_indices.tolist())
         req_ids = self.input_batch.req_ids
         opted_in_agg = self.input_batch.emit_aggregate_logprob_stats
-        opted_in_seq = self.input_batch.emit_per_token_feature_seq
         # Synchronous CPU copy — non_blocking races with downstream
         # reads of lp_cpu. The 4xA10G validation showed garbage values
         # (e.g. 1.4e-40, denormalized floats from uninitialized memory)
@@ -3409,24 +3408,59 @@ class GPUModelRunner(
             if req_idx in discard_set:
                 continue
             req_id = req_ids[req_idx]
-            is_agg = req_id in opted_in_agg
-            is_seq = req_id in opted_in_seq
-            if not (is_agg or is_seq):
+            if req_id not in opted_in_agg:
                 continue
             if float(row_sum_prob[req_idx]) < 0.01:
                 continue
             chosen_lp = float(lp_cpu[req_idx, 0])
             topk_lp = lp_cpu[req_idx, 1:]  # [K]
-            if is_agg:
-                self._lp_stats_accumulator.register_request(req_id)
-                self._lp_stats_accumulator.update(
-                    req_id, chosen_lp, topk_lp,
-                )
-            if is_seq:
-                self._lp_feature_seq_accumulator.register_request(req_id)
-                self._lp_feature_seq_accumulator.update(
-                    req_id, chosen_lp, topk_lp,
-                )
+            self._lp_stats_accumulator.register_request(req_id)
+            self._lp_stats_accumulator.update(
+                req_id, chosen_lp, topk_lp,
+            )
+
+    def _update_feature_seq_accumulator_step(
+        self,
+        feature_seq_tensor: torch.Tensor,  # [num_sampled_tokens, 3]
+        num_sampled_tokens: int,
+        discard_indices: np.ndarray,
+    ) -> None:
+        """SYS25 Phase 3 — append per-step feature row to per-request
+        FeatureSeqAccumulator. The row is (chosen_lp, max_p, neg_entropy),
+        already computed on GPU by the sampler. CPU side just does a
+        small [num_sampled_tokens, 3] copy and 3-float-per-req append —
+        no torch.exp/log/sum work (that's all on GPU now)."""
+        from vllm.distributed.parallel_state import get_tp_group
+        if get_tp_group().rank_in_group != 0:
+            return
+        opted_in_seq = self.input_batch.emit_per_token_feature_seq
+        if not opted_in_seq:
+            return
+        discard_set = set(discard_indices.tolist())
+        req_ids = self.input_batch.req_ids
+        # Synchronous CPU copy of the small [N, 3] tensor.
+        fs_cpu = feature_seq_tensor.detach().to("cpu").float()
+        # A degenerate row (e.g. uninitialized for a prefilling request)
+        # has chosen_lp == 0 and max_p == 1 == neg_entropy == 0. The
+        # cheapest guard is checking max_p is in (0, 1.001].
+        max_ps = fs_cpu[:, 1]
+        for req_idx in range(num_sampled_tokens):
+            if req_idx in discard_set:
+                continue
+            req_id = req_ids[req_idx]
+            if req_id not in opted_in_seq:
+                continue
+            mp = float(max_ps[req_idx])
+            if mp <= 0.0 or mp > 1.001:
+                continue
+            self._lp_feature_seq_accumulator.register_request(req_id)
+            # Skip the existing update_from_step (which does torch.exp +
+            # entropy compute on CPU). Append the pre-computed row
+            # directly.
+            st = self._lp_feature_seq_accumulator._state[req_id]
+            st.chosen_lp.append(float(fs_cpu[req_idx, 0]))
+            st.max_p.append(mp)
+            st.neg_entropy.append(float(fs_cpu[req_idx, 2]))
 
     def _bookkeeping_sync(
         self,
@@ -3477,14 +3511,25 @@ class GPUModelRunner(
         # cascade routing doesn't use spec decode at the draft tier.
         if (
             logprobs_tensors is not None
-            and (
-                self.input_batch.emit_aggregate_logprob_stats
-                or self.input_batch.emit_per_token_feature_seq
-            )
+            and self.input_batch.emit_aggregate_logprob_stats
             and sampled_token_ids.shape[-1] == 1
         ):
             self._update_lp_stats_accumulator_step(
                 logprobs_tensors, num_sampled_tokens,
+                discard_sampled_tokens_req_indices,
+            )
+        # SYS25 Phase 3 — feature_seq accumulator consumes the new
+        # GPU-side [N, 3] tensor (chosen_lp, max_p, neg_entropy)
+        # produced inline by the sampler, independent of
+        # logprobs_tensors.
+        fs_tensor = getattr(sampler_output, "feature_seq_tensor", None)
+        if (
+            fs_tensor is not None
+            and self.input_batch.emit_per_token_feature_seq
+            and sampled_token_ids.shape[-1] == 1
+        ):
+            self._update_feature_seq_accumulator_step(
+                fs_tensor, num_sampled_tokens,
                 discard_sampled_tokens_req_indices,
             )
         logprobs_lists = None
