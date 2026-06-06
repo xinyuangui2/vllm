@@ -391,13 +391,23 @@ def compute_aggregate_from_sample_logprobs(
 
 
 # ============================================================
-# SYS25 Phase 4 — in-engine attn_pool head forward.
+# SYS25 Phase 4 / SYS25c — in-engine cascade head forward.
 # Loaded once per OutputProcessor lifetime from env vars; fired
 # at end-of-sequence from RequestState._new_completion_output.
 # Brings the gate inside the engine so a single engine.generate
 # call returns both the text and the SHIP/REGEN decision —
 # eliminates the "engine emits logprobs → driver-side gate"
 # split that the paper draft would otherwise have to explain.
+#
+# Arch dispatch (SYS25c): the same env-var path loads any of the
+# trained SeqDataset architectures from
+# scripts/sys22t_p16b_train_seq_models.py. Arch is read from
+# ckpt["hparams"]["arch"]:
+#   AttnPool       → _InEngineAttnPool      (Phase 4, ~449 params)
+#   TransformerSeq → _InEngineTransformerL2 (SYS25c, ~67k params, L=2)
+# Both mirror the driver-side module bit-exactly so loaded weights
+# produce identical scores. Same `decide(feature_seq, source)` →
+# CompletionOutput.head_decision interface either way.
 # ============================================================
 
 
@@ -424,12 +434,94 @@ class _InEngineAttnPool(torch.nn.Module):
         return self.classifier(pooled).squeeze(-1)
 
 
-class InEngineAttnPoolHead:
-    """Phase 4 in-engine cascade gate. Loaded once per OutputProcessor;
-    decides SHIP/REGEN from the per-token feature seq at end of sequence.
+class _InEnginePositionalEncoding(torch.nn.Module):
+    """Mirror of TransformerSeq's PositionalEncoding (sys22t_p16b).
+    Registers the same `pe` buffer so a TransformerSeq state_dict
+    loads with strict=True."""
+
+    def __init__(self, d_model: int, max_len: int = 600):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2).float()
+                        * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div)
+        pe[:, 1::2] = torch.cos(position * div)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.pe[: x.shape[1]].unsqueeze(0)
+
+
+class _InEngineTransformerL2(torch.nn.Module):
+    """Mirror of paper_explore/scripts/sys22t_p16b_train_seq_models.py
+    TransformerSeq. Same module names (`proj`, `pe`, `encoder`,
+    `classifier`) and same torch.nn building blocks so loaded weights
+    produce bit-identical scores to the driver-side gate.
+
+    Default hparams = SYS22-T P18 transformer_L2:
+      n_features=4, d_model=64, n_heads=4, n_layers=2, d_ff=128.
+    """
+
+    def __init__(self, n_features: int = 4, d_model: int = 64,
+                 n_heads: int = 4, n_layers: int = 2,
+                 d_ff: int = 128):
+        super().__init__()
+        self.proj = torch.nn.Linear(n_features, d_model)
+        self.pe = _InEnginePositionalEncoding(d_model, max_len=600)
+        enc = torch.nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
+            dropout=0.0, batch_first=True, activation="gelu",
+        )
+        self.encoder = torch.nn.TransformerEncoder(enc, num_layers=n_layers)
+        self.classifier = torch.nn.Linear(d_model, 1)
+
+    def forward(self, x: torch.Tensor, lens: torch.Tensor) -> torch.Tensor:
+        B, T, _ = x.shape
+        mask = torch.arange(T, device=x.device).unsqueeze(0) >= \
+               lens.to(x.device).unsqueeze(1)
+        h = self.proj(x)
+        h = self.pe(h)
+        h = self.encoder(h, src_key_padding_mask=mask)
+        not_mask = (~mask).float().unsqueeze(-1)
+        pooled = (h * not_mask).sum(dim=1) / not_mask.sum(dim=1).clamp(min=1)
+        return self.classifier(pooled).squeeze(-1)
+
+
+def _build_head_module(hp: dict[str, Any]) -> torch.nn.Module:
+    """Arch dispatch from ckpt["hparams"]. Keep this in sync with
+    sys22t_p16b_train_seq_models.py's model_specs."""
+    arch = hp.get("arch")
+    if arch == "AttnPool":
+        return _InEngineAttnPool(
+            n_features=int(hp.get("n_features", 4)),
+            d_model=int(hp.get("d_model", 64)),
+        )
+    if arch == "TransformerSeq":
+        return _InEngineTransformerL2(
+            n_features=int(hp.get("n_features", 4)),
+            d_model=int(hp.get("d_model", 64)),
+            n_heads=int(hp.get("n_heads", 4)),
+            n_layers=int(hp.get("n_layers", 2)),
+            d_ff=int(hp.get("d_ff", 128)),
+        )
+    raise ValueError(
+        f"InEngineCascadeHead: unsupported arch={arch!r}; expected "
+        f"'AttnPool' or 'TransformerSeq' (see "
+        f"sys22t_p16b_train_seq_models.py)."
+    )
+
+
+class InEngineCascadeHead:
+    """In-engine cascade gate. Loaded once per OutputProcessor; decides
+    SHIP/REGEN from the per-token feature seq at end of sequence.
 
     Decision: sigmoid(model(feature_seq)) >= τ[source] → SHIP else REGEN.
     Same arithmetic as paper_explore/glue/gate.py:transformer_seq_gate.
+
+    Arch is dispatched from ckpt["hparams"]["arch"]; see
+    `_build_head_module`. The same env-var path serves both attn_pool
+    (Phase 4) and transformer_L2 (SYS25c).
     """
 
     def __init__(self, ckpt_path: str, tau_table_path: str) -> None:
@@ -437,15 +529,8 @@ class InEngineAttnPoolHead:
         ckpt = torch.load(ckpt_path, weights_only=False,
                           map_location="cpu")
         hp = ckpt["hparams"]
-        if hp.get("arch") != "AttnPool":
-            raise ValueError(
-                f"InEngineAttnPoolHead expects arch=AttnPool, got "
-                f"{hp.get('arch')!r}"
-            )
-        self.model = _InEngineAttnPool(
-            n_features=int(hp.get("n_features", 4)),
-            d_model=int(hp.get("d_model", 64)),
-        )
+        self.arch = hp.get("arch")
+        self.model = _build_head_module(hp)
         self.model.load_state_dict(ckpt["state_dict"])
         self.model.eval()
         with open(tau_table_path) as _f:
@@ -456,8 +541,10 @@ class InEngineAttnPoolHead:
         self.per_source = self.tau_table.get("per_source", {}) or {}
         # Warmup so first inference doesn't pay PyTorch dispatch JIT cost
         with torch.inference_mode():
-            _ = self.model(torch.zeros(1, 8, hp.get("n_features", 4)),
-                           torch.tensor([8]))
+            _ = self.model(
+                torch.zeros(1, 8, int(hp.get("n_features", 4))),
+                torch.tensor([8]),
+            )
 
     def tau_for(self, source: str | None) -> float:
         if source and source in self.per_source:
@@ -490,15 +577,26 @@ class InEngineAttnPoolHead:
         }
 
 
+# Back-compat alias: existing callers (output_processor.py, the
+# paper_explore bench harness) import / log this name from Phase 4.
+# The class is now arch-dispatched, so the name no longer literally
+# means "attn_pool only" — it's the cascade head, arch read from
+# the ckpt. Renaming the env vars would break the bench wiring.
+InEngineAttnPoolHead = InEngineCascadeHead
+
+
 # Singleton — loaded on first access, reused for all requests in the
-# engine's lifetime. Env vars:
-#   VLLM_CASCADE_ATTN_POOL_CKPT  — path to attn_pool.pt
+# engine's lifetime. Env vars (unchanged from Phase 4 for backwards
+# compat with the existing bench harness wiring; arch is read from
+# the ckpt):
+#   VLLM_CASCADE_ATTN_POOL_CKPT  — path to head .pt (AttnPool OR
+#                                  TransformerSeq state_dict + hparams)
 #   VLLM_CASCADE_ATTN_POOL_TAU   — path to tau-table .json
-_HEAD_SINGLETON: "InEngineAttnPoolHead | None" = None
+_HEAD_SINGLETON: "InEngineCascadeHead | None" = None
 _HEAD_INIT_TRIED: bool = False
 
 
-def get_in_engine_head() -> "InEngineAttnPoolHead | None":
+def get_in_engine_head() -> "InEngineCascadeHead | None":
     global _HEAD_SINGLETON, _HEAD_INIT_TRIED
     if _HEAD_SINGLETON is not None or _HEAD_INIT_TRIED:
         return _HEAD_SINGLETON
@@ -510,14 +608,15 @@ def get_in_engine_head() -> "InEngineAttnPoolHead | None":
     if not ckpt or not tau:
         return None
     try:
-        _HEAD_SINGLETON = InEngineAttnPoolHead(ckpt, tau)
+        _HEAD_SINGLETON = InEngineCascadeHead(ckpt, tau)
         _logging.getLogger(__name__).info(
-            "[SYS25 Phase 4] Loaded in-engine cascade attn_pool head "
-            "from ckpt=%s tau=%s", ckpt, tau,
+            "[SYS25 Phase 4/c] Loaded in-engine cascade head arch=%s "
+            "from ckpt=%s tau=%s",
+            _HEAD_SINGLETON.arch, ckpt, tau,
         )
     except Exception as e:  # noqa: BLE001
         _logging.getLogger(__name__).warning(
-            "[SYS25 Phase 4] Failed to load in-engine head: %s", e,
+            "[SYS25 Phase 4/c] Failed to load in-engine head: %s", e,
         )
         _HEAD_SINGLETON = None
     return _HEAD_SINGLETON
