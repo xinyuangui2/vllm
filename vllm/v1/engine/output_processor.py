@@ -182,6 +182,11 @@ class RequestState:
         # token CPU serialization) is the follow-up patch described in
         # PAPER_EXPLORE_LP_CLASSIFIER_INLINE.md.
         self.emit_aggregate_logprob_stats = False
+        # paper_explore SYS25 — per-token feature seq opt-in flag.
+        # When set, gpu_model_runner emits per-step rows of
+        # [chosen_lp, max_p, neg_entropy]; we extend the 3 lists across
+        # steps and finalize to [T, 4] (with pos_frac) at request end.
+        self.emit_per_token_feature_seq = False
         self.queue = queue
         self.num_cached_tokens = 0
 
@@ -289,6 +294,18 @@ class RequestState:
         # only when the inline (GPU-side) path emits it. Driver-side
         # reference is used as fallback if this stays None.
         state.aggregate_lp_stats_running = None
+        # paper_explore SYS25 — per-token feature seq opt-in.
+        if (
+            request.sampling_params is not None
+            and getattr(
+                request.sampling_params, "emit_per_token_feature_seq", False,
+            )
+        ):
+            state.emit_per_token_feature_seq = True
+        # Running per-step rows from gpu_model_runner; three parallel
+        # lists (chosen_lp, max_p, neg_entropy) that we extend across
+        # steps and reshape to [T, 4] at finalize.
+        state.per_token_feature_seq_running = None
         return state
 
     def make_request_output(
@@ -446,6 +463,38 @@ class RequestState:
                     full_logprobs, list(full_token_ids),
                 )
 
+        # paper_explore SYS25 per-token feature seq. Same two-path
+        # design as the aggregate above:
+        # (1) inline: extend the (chosen_lp, max_p, neg_entropy) triple
+        #     of lists across steps; at finalize, tack on pos_frac and
+        #     reshape to [T, 4].
+        # (2) driver-side fallback: compute from SampleLogprobs.
+        per_token_features = None
+        if finished and self.emit_per_token_feature_seq:
+            running = self.per_token_feature_seq_running
+            if running is not None:
+                chosen_lp_list, max_p_list, neg_ent_list = running
+                T = len(chosen_lp_list)
+                if T > 0:
+                    per_token_features = [
+                        [
+                            chosen_lp_list[i],
+                            max_p_list[i],
+                            neg_ent_list[i],
+                            (i + 1) / T,
+                        ]
+                        for i in range(T)
+                    ]
+            if per_token_features is None:
+                from vllm.v1.cascade_lp_classifier import (
+                    compute_feature_seq_from_sample_logprobs,
+                )
+                full_logprobs = self.logprobs_processor.logprobs
+                full_token_ids = self.detokenizer.output_token_ids
+                per_token_features = compute_feature_seq_from_sample_logprobs(
+                    full_logprobs, list(full_token_ids),
+                )
+
         return CompletionOutput(
             index=self.request_index,
             text=text,
@@ -456,6 +505,7 @@ class RequestState:
             finish_reason=str(finish_reason) if finished else None,
             stop_reason=stop_reason if finished else None,
             aggregate_logprob_stats=aggregate_logprob_stats,
+            per_token_features=per_token_features,
         )
 
     def _new_pooling_output(self, pooling_output: torch.Tensor) -> PoolingOutput:
@@ -678,6 +728,14 @@ class OutputProcessor:
             if engine_core_output.aggregate_lp_stats_running is not None:
                 req_state.aggregate_lp_stats_running = (
                     engine_core_output.aggregate_lp_stats_running
+                )
+
+            # paper_explore SYS25: stash latest per-token feature seq
+            # running state. Lists of length = current T; finalized at
+            # completion (tack on pos_frac, reshape to [T, 4]).
+            if engine_core_output.per_token_feature_seq_running is not None:
+                req_state.per_token_feature_seq_running = (
+                    engine_core_output.per_token_feature_seq_running
                 )
 
             if pooling_output is None:

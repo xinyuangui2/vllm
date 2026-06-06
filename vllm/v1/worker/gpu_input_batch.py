@@ -244,6 +244,13 @@ class InputBatch:
         # PAPER_EXPLORE_LP_CLASSIFIER_INLINE.md.
         self.emit_aggregate_logprob_stats: set[str] = set()
 
+        # paper_explore SYS25 per-token feature seq. Set of request ids
+        # that opted in via SamplingParams.emit_per_token_feature_seq.
+        # gpu_model_runner appends one [chosen_lp, max_p, neg_entropy]
+        # row per step for these requests; pos_frac and the [T, 4]
+        # tensor are finalized when the request finishes.
+        self.emit_per_token_feature_seq: set[str] = set()
+
         # To accumulate prompt logprobs tensor chunks across prefill steps.
         self.in_progress_prompt_logprobs_cpu: dict[str, LogprobsTensors] = {}
 
@@ -411,6 +418,9 @@ class InputBatch:
             if getattr(sampling_params, "emit_aggregate_logprob_stats",
                        False):
                 self.emit_aggregate_logprob_stats.add(req_id)
+            if getattr(sampling_params, "emit_per_token_feature_seq",
+                       False):
+                self.emit_per_token_feature_seq.add(req_id)
 
             if sampling_params.allowed_token_ids:
                 self.has_allowed_token_ids.add(req_id)
@@ -541,6 +551,7 @@ class InputBatch:
         self.num_logprobs.pop(req_id, None)
         self.in_progress_prompt_logprobs_cpu.pop(req_id, None)
         self.emit_aggregate_logprob_stats.discard(req_id)
+        self.emit_per_token_feature_seq.discard(req_id)
         if self.prev_req_id_to_index is not None:
             self.prev_req_id_to_index.pop(req_id, None)
 

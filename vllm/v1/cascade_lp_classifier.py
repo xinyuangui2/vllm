@@ -130,6 +130,156 @@ class LogprobStatsAccumulator:
 
 
 # ---------------------------------------------------------------------
+# SYS25 — per-token feature seq accumulator.
+#
+# Extension of the aggregate path: instead of summing per-step features
+# into 5 scalars, store one row of [chosen_lp, max_p, neg_entropy] per
+# decode step. At finalization, the driver tacks on pos_frac (= (i+1)/T)
+# and returns the [T, 4] feature array to be consumed directly by the
+# scheduler-side per-token gate (attn_pool / transformer_L2 in SYS22-T
+# P18). Saves the per-step Logprob dict construction + driver-side
+# detokenization that the standard `logprobs=K` path pays.
+# ---------------------------------------------------------------------
+
+@dataclass
+class PerRequestFeatureSeq:
+    """One per active request. Per-step rows of [chosen_lp, max_p,
+    neg_entropy] (3 floats). pos_frac is added at finalize time."""
+
+    chosen_lp: list[float] | None = None
+    max_p: list[float] | None = None
+    neg_entropy: list[float] | None = None
+
+    def __post_init__(self) -> None:
+        if self.chosen_lp is None:
+            self.chosen_lp = []
+        if self.max_p is None:
+            self.max_p = []
+        if self.neg_entropy is None:
+            self.neg_entropy = []
+
+    def update_from_step(
+        self,
+        chosen_logprob: float,
+        topk_logprobs: torch.Tensor,  # [K] sorted descending
+    ) -> None:
+        """Append one row's (chosen_lp, max_p, neg_entropy). pos_frac
+        is computed in finalize() since it depends on the final T."""
+        self.chosen_lp.append(float(chosen_logprob))
+        # max_prob: top-K is sorted desc; first entry is max
+        self.max_p.append(float(torch.exp(topk_logprobs[0])))
+        # top-K entropy: same math as PerRequestLogprobStats above
+        probs = torch.exp(topk_logprobs)
+        z = probs.sum()
+        if float(z) > 0 and topk_logprobs.shape[0] > 1:
+            normalized = probs / z
+            log_p = torch.log(normalized.clamp(min=1e-30))
+            entropy = -float((normalized * log_p).sum())
+            self.neg_entropy.append(-entropy)
+        else:
+            self.neg_entropy.append(0.0)
+
+    def finalize(self) -> list[list[float]] | None:
+        """Return [T, 4] = [[chosen_lp, max_p, neg_entropy, pos_frac]]
+        per row. None if no steps recorded."""
+        T = len(self.chosen_lp)
+        if T == 0:
+            return None
+        out = []
+        for i in range(T):
+            pos_frac = (i + 1) / T
+            out.append([
+                self.chosen_lp[i],
+                self.max_p[i],
+                self.neg_entropy[i],
+                pos_frac,
+            ])
+        return out
+
+
+class FeatureSeqAccumulator:
+    """Per-engine registry of per-request feature-seq accumulators.
+
+    Same lifecycle as LogprobStatsAccumulator (register/update/finalize)
+    but stores per-step rows instead of running sums. Memory: ~3 floats
+    per decoded token per active request — for 30 concurrent requests
+    × 200 tokens = ~3 KB total, negligible.
+    """
+
+    def __init__(self) -> None:
+        self._state: dict[str, PerRequestFeatureSeq] = {}
+
+    def register_request(self, req_id: str) -> None:
+        self._state.setdefault(req_id, PerRequestFeatureSeq())
+
+    def has_request(self, req_id: str) -> bool:
+        return req_id in self._state
+
+    def update(
+        self,
+        req_id: str,
+        chosen_logprob: float,
+        topk_logprobs: torch.Tensor,
+    ) -> None:
+        st = self._state.get(req_id)
+        if st is None:
+            return
+        st.update_from_step(chosen_logprob, topk_logprobs)
+
+    def finalize(self, req_id: str) -> list[list[float]] | None:
+        st = self._state.pop(req_id, None)
+        if st is None:
+            return None
+        return st.finalize()
+
+
+def compute_feature_seq_from_sample_logprobs(
+    logprobs: "SampleLogprobs",
+    token_ids: list[int],
+) -> list[list[float]] | None:
+    """Driver-side reference implementation of the feature seq.
+
+    Same math as PerRequestFeatureSeq + pos_frac. Used as a numerical
+    reference for validating the inline accumulator and as a fallback
+    when the GPU side didn't produce features (e.g. partial generation).
+    """
+    if not logprobs or not token_ids:
+        return None
+    rows: list[list[float]] = []
+    for pos, lp_dict in enumerate(logprobs):
+        if lp_dict is None or pos >= len(token_ids):
+            continue
+        chosen_tid = token_ids[pos]
+        chosen = lp_dict.get(chosen_tid)
+        if chosen is None:
+            continue
+        chosen_lp = float(chosen.logprob)
+        topk_lps = sorted(
+            (float(v.logprob) for v in lp_dict.values()), reverse=True,
+        )
+        if not topk_lps:
+            continue
+        max_p = math.exp(topk_lps[0])
+        neg_ent = 0.0
+        if len(topk_lps) > 1:
+            probs = [math.exp(lp) for lp in topk_lps]
+            z = sum(probs)
+            if z > 0:
+                normalized = [p / z for p in probs]
+                entropy = -sum(
+                    p * math.log(max(p, 1e-30)) for p in normalized
+                )
+                neg_ent = -entropy
+        rows.append([chosen_lp, max_p, neg_ent, 0.0])  # pos_frac filled below
+    T = len(rows)
+    if T == 0:
+        return None
+    for i in range(T):
+        rows[i][3] = (i + 1) / T
+    return rows
+
+
+# ---------------------------------------------------------------------
 # Hook called from gpu_model_runner._bookkeeping_sync after the sampler
 # has produced logprobs_tensors. NOT YET INTEGRATED into the model
 # runner — see PAPER_EXPLORE_LP_CLASSIFIER_INLINE.md for the rest.

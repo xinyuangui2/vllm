@@ -173,6 +173,13 @@ class EngineCoreOutput(
     # Output processor accumulates running totals across steps and
     # finalizes (divides by n_steps) at request completion.
     aggregate_lp_stats_running: tuple[float, float, float, float, int] | None = None
+    # paper_explore SYS25 per-token feature seq (per-step rows of
+    # [chosen_lp, max_p, neg_entropy]). Output processor accumulates
+    # across steps (extends the 3 lists) and finalizes (adds pos_frac
+    # and re-shapes to [T, 4]) at request completion.
+    per_token_feature_seq_running: tuple[
+        list[float], list[float], list[float]
+    ] | None = None
 
     @property
     def finished(self) -> bool:

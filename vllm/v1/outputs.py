@@ -262,6 +262,17 @@ class ModelRunnerOutput:
         dict[str, tuple[float, float, float, float, int]] | None
     ) = None
 
+    # paper_explore SYS25 per-token feature seq accumulator state.
+    # req_id -> (chosen_lp_list, max_p_list, neg_entropy_list)
+    # Three parallel lists of floats with length = number of decoded
+    # tokens for this request. Populated by gpu_model_runner per step;
+    # the scheduler plumbs them through EngineCoreOutput; the engine
+    # output processor tacks on pos_frac and emits the [T, 4] list-of-
+    # list in CompletionOutput.per_token_features.
+    per_token_feature_seq_running: (
+        dict[str, tuple[list[float], list[float], list[float]]] | None
+    ) = None
+
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 

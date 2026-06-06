@@ -57,6 +57,13 @@ class CompletionOutput:
     # Each is a single float; None if the request didn't opt in or
     # generated zero tokens.
     aggregate_logprob_stats: dict[str, float] | None = None
+    # paper_explore SYS25 per-token feature sequence. Populated only
+    # when SamplingParams.emit_per_token_feature_seq=True. Each row is
+    # [chosen_lp, max_p, neg_entropy, pos_frac]; outer list length = T
+    # (number of decoded tokens). Consumed directly by the SYS22-T P18
+    # per-token gate (attn_pool / transformer_L2) — saves the per-step
+    # Logprob-dict construction the standard `logprobs=K` path pays.
+    per_token_features: list[list[float]] | None = None
 
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -70,6 +77,8 @@ class CompletionOutput:
             f"cumulative_logprob={self.cumulative_logprob}, "
             f"logprobs={self.logprobs}, "
             f"aggregate_logprob_stats={self.aggregate_logprob_stats}, "
+            f"per_token_features_len="
+            f"{len(self.per_token_features) if self.per_token_features else 0}, "
             f"finish_reason={self.finish_reason}, "
             f"stop_reason={self.stop_reason})"
         )

@@ -1311,6 +1311,10 @@ class Scheduler(SchedulerInterface):
         aggregate_lp_stats_running = (
             model_runner_output.aggregate_lp_stats_running
         )
+        # paper_explore SYS25 per-token feature seq accumulator state.
+        per_token_feature_seq_running = (
+            model_runner_output.per_token_feature_seq_running
+        )
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
@@ -1464,6 +1468,13 @@ class Scheduler(SchedulerInterface):
                     if aggregate_lp_stats_running is not None
                     else None
                 )
+                # paper_explore SYS25: include per-token feature seq if
+                # opted in.
+                ptf_seq_running = (
+                    per_token_feature_seq_running.get(req_id)
+                    if per_token_feature_seq_running is not None
+                    else None
+                )
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     EngineCoreOutput(
@@ -1482,6 +1493,7 @@ class Scheduler(SchedulerInterface):
                         routed_experts=routed_experts,
                         num_nans_in_logits=request.num_nans_in_logits,
                         aggregate_lp_stats_running=agg_lp_running,
+                        per_token_feature_seq_running=ptf_seq_running,
                     )
                 )
             else:

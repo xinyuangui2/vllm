@@ -246,6 +246,16 @@ class SamplingParams(
     routing experiments. Requires `logprobs >= 2` for `mean_max_prob`
     and `neg_mean_entropy`; with `logprobs == 1` only the chosen-token
     stats (mean_logprob, min_logprob) are meaningful."""
+    emit_per_token_feature_seq: bool = False
+    """SYS25 — If True, emit per-request `per_token_features` list in
+    CompletionOutput: a [T, 4] array with rows
+    `[chosen_lp, max_p, neg_entropy, pos_frac]` per decoded token. Same
+    feature schema as SYS22-T P18 attn_pool / transformer_L2. Computed
+    inline during decoding from the sampler's per-step top-K logprobs;
+    avoids per-step Logprob-dict construction + detokenization on the
+    driver. Requires `logprobs >= 2` (mirrors emit_aggregate_logprob_stats);
+    with smaller K, `max_p` and `neg_entropy` are computed over the
+    available top-K only."""
     # NOTE: This parameter is only exposed at the engine level for now.
     # It is not exposed in the OpenAI API server, as the OpenAI API does
     # not support returning only a list of token IDs.

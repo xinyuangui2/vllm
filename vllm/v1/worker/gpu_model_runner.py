@@ -642,11 +642,17 @@ class GPUModelRunner(
         # in via SamplingParams.emit_aggregate_logprob_stats. The 4
         # finalized stats flow out via the per-request finished-stats
         # dict at request completion. See PAPER_EXPLORE_LP_CLASSIFIER_INLINE.md.
-        from vllm.v1.cascade_lp_classifier import LogprobStatsAccumulator
+        from vllm.v1.cascade_lp_classifier import (
+            LogprobStatsAccumulator, FeatureSeqAccumulator,
+        )
         self._lp_stats_accumulator = LogprobStatsAccumulator()
         # Finalized stats indexed by request id; drained by the engine
         # when constructing EngineCoreOutput.
         self._lp_stats_finalized: dict[str, dict[str, float]] = {}
+        # paper_explore SYS25 — per-token feature seq accumulator.
+        # Same lifecycle as the aggregate one, but per-step rows live
+        # in PerRequestFeatureSeq lists instead of running sums.
+        self._lp_feature_seq_accumulator = FeatureSeqAccumulator()
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
         # GPU to CPU when async scheduling is enabled.
@@ -3385,7 +3391,8 @@ class GPUModelRunner(
         lp = logprobs_tensors.logprobs  # [num_sampled_tokens, K+1]
         discard_set = set(discard_indices.tolist())
         req_ids = self.input_batch.req_ids
-        opted_in = self.input_batch.emit_aggregate_logprob_stats
+        opted_in_agg = self.input_batch.emit_aggregate_logprob_stats
+        opted_in_seq = self.input_batch.emit_per_token_feature_seq
         # Synchronous CPU copy — non_blocking races with downstream
         # reads of lp_cpu. The 4xA10G validation showed garbage values
         # (e.g. 1.4e-40, denormalized floats from uninitialized memory)
@@ -3402,14 +3409,24 @@ class GPUModelRunner(
             if req_idx in discard_set:
                 continue
             req_id = req_ids[req_idx]
-            if req_id not in opted_in:
+            is_agg = req_id in opted_in_agg
+            is_seq = req_id in opted_in_seq
+            if not (is_agg or is_seq):
                 continue
             if float(row_sum_prob[req_idx]) < 0.01:
                 continue
             chosen_lp = float(lp_cpu[req_idx, 0])
             topk_lp = lp_cpu[req_idx, 1:]  # [K]
-            self._lp_stats_accumulator.register_request(req_id)
-            self._lp_stats_accumulator.update(req_id, chosen_lp, topk_lp)
+            if is_agg:
+                self._lp_stats_accumulator.register_request(req_id)
+                self._lp_stats_accumulator.update(
+                    req_id, chosen_lp, topk_lp,
+                )
+            if is_seq:
+                self._lp_feature_seq_accumulator.register_request(req_id)
+                self._lp_feature_seq_accumulator.update(
+                    req_id, chosen_lp, topk_lp,
+                )
 
     def _bookkeeping_sync(
         self,
@@ -3460,7 +3477,10 @@ class GPUModelRunner(
         # cascade routing doesn't use spec decode at the draft tier.
         if (
             logprobs_tensors is not None
-            and self.input_batch.emit_aggregate_logprob_stats
+            and (
+                self.input_batch.emit_aggregate_logprob_stats
+                or self.input_batch.emit_per_token_feature_seq
+            )
             and sampled_token_ids.shape[-1] == 1
         ):
             self._update_lp_stats_accumulator_step(
@@ -4416,6 +4436,27 @@ class GPUModelRunner(
                         st.n_steps,
                     )
 
+            # paper_explore SYS25: snapshot the per-token feature-seq
+            # accumulator state for opted-in requests. Per request we
+            # ship 3×T floats (chosen_lp, max_p, neg_entropy lists);
+            # pos_frac is computed at engine finalization since it
+            # depends on the final T. List-of-list to keep the IPC
+            # path msgspec-friendly.
+            feat_seq = None
+            if self.input_batch.emit_per_token_feature_seq:
+                feat_seq = {}
+                # pylint: disable=protected-access
+                fs_state = self._lp_feature_seq_accumulator._state
+                for rid in self.input_batch.emit_per_token_feature_seq:
+                    fs = fs_state.get(rid)
+                    if fs is None or not fs.chosen_lp:
+                        continue
+                    feat_seq[rid] = (
+                        list(fs.chosen_lp),
+                        list(fs.max_p),
+                        list(fs.neg_entropy),
+                    )
+
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -4428,6 +4469,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 aggregate_lp_stats_running=agg_lp,
+                per_token_feature_seq_running=feat_seq,
                 cudagraph_stats=cudagraph_stats,
             )
 
