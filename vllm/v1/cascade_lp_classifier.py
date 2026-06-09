@@ -465,10 +465,10 @@ class _InEngineTransformerL2(torch.nn.Module):
 
     def __init__(self, n_features: int = 4, d_model: int = 64,
                  n_heads: int = 4, n_layers: int = 2,
-                 d_ff: int = 128):
+                 d_ff: int = 128, max_len: int = 600):
         super().__init__()
         self.proj = torch.nn.Linear(n_features, d_model)
-        self.pe = _InEnginePositionalEncoding(d_model, max_len=600)
+        self.pe = _InEnginePositionalEncoding(d_model, max_len=max_len)
         enc = torch.nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=d_ff,
             dropout=0.0, batch_first=True, activation="gelu",
@@ -504,6 +504,7 @@ def _build_head_module(hp: dict[str, Any]) -> torch.nn.Module:
             n_heads=int(hp.get("n_heads", 4)),
             n_layers=int(hp.get("n_layers", 2)),
             d_ff=int(hp.get("d_ff", 128)),
+            max_len=int(hp.get("max_len", 600)),
         )
     raise ValueError(
         f"InEngineCascadeHead: unsupported arch={arch!r}; expected "
