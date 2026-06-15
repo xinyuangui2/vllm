@@ -227,6 +227,10 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         invalid_req_indices: list[int],
         async_output_copy_stream: torch.cuda.Stream,
         vocab_size: int,
+        # SYS55 V2: defer the per-token feature-seq D2H onto this same copy
+        # stream/event (one extra non-blocking copy, no extra sync).
+        pending_feature_seq=None,
+        feature_finalize_fn=None,
     ):
         self._model_runner_output = model_runner_output
         self._invalid_req_indices = invalid_req_indices
@@ -240,6 +244,18 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         self.vocab_size = vocab_size
         self._logprobs_tensors = logprobs_tensors
 
+        # SYS55 V2 — feature-seq deferred copy bookkeeping.
+        self._feature_finalize_fn = feature_finalize_fn
+        self._feature_seq_meta = None
+        self._feature_seq_cpu = None
+        fs_tensor = None
+        if pending_feature_seq is not None:
+            (fs_tensor, fs_req_ids, fs_discard, fs_n, fs_emit) = (
+                pending_feature_seq
+            )
+            self._feature_seq_meta = (fs_req_ids, fs_discard, fs_n, fs_emit)
+            self._feature_seq_tensor = fs_tensor  # keep ref alive
+
         # Initiate the copy on a separate stream, but do not synchronize it.
         default_stream = torch.cuda.current_stream()
         with torch.cuda.stream(async_output_copy_stream):
@@ -252,6 +268,12 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
                 if self._logprobs_tensors
                 else None
             )
+            if fs_tensor is not None:
+                # feature_seq_tensor is already float32 (sampler stack); the
+                # CPU read happens only after event.synchronize() in get_output.
+                self._feature_seq_cpu = fs_tensor.detach().to(
+                    "cpu", non_blocking=True
+                )
             self.async_copy_ready_event.record()
 
     def get_output(self) -> ModelRunnerOutput:
@@ -283,6 +305,14 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         output = self._model_runner_output
         output.sampled_token_ids = valid_sampled_token_ids
         output.logprobs = logprobs_lists
+        # SYS55 V2 — the feature-seq D2H is now complete (same event we just
+        # synced). Append this step's rows + build the snapshot here, off the
+        # per-step critical path.
+        if self._feature_seq_cpu is not None and self._feature_finalize_fn:
+            fs_req_ids, fs_discard, fs_n, fs_emit = self._feature_seq_meta
+            output.per_token_feature_seq_running = self._feature_finalize_fn(
+                self._feature_seq_cpu, fs_req_ids, fs_discard, fs_n, fs_emit,
+            )
         return output
 
 
@@ -3462,6 +3492,51 @@ class GPUModelRunner(
             st.max_p.append(mp)
             st.neg_entropy.append(float(fs_cpu[req_idx, 2]))
 
+    def _finalize_feature_seq_async(
+        self,
+        fs_cpu: torch.Tensor,          # already on CPU (copied on the async
+                                       # output stream; event synced upstream)
+        req_ids: list[str],
+        discard_set: set[int],
+        num_sampled_tokens: int,
+        emit_set,
+    ) -> dict | None:
+        """SYS55 V2 — deferred feature-seq finalize, run in
+        AsyncGPUModelRunnerOutput.get_output() AFTER the single async-copy
+        event.synchronize() (so NO extra per-step sync). Appends this step's
+        rows to the per-request accumulator and returns the cumulative
+        snapshot dict for ModelRunnerOutput.per_token_feature_seq_running.
+        Bit-identical to the eager path; only the COPY moved off the
+        critical path."""
+        max_ps = fs_cpu[:, 1]
+        for req_idx in range(num_sampled_tokens):
+            if req_idx in discard_set:
+                continue
+            req_id = req_ids[req_idx]
+            if req_id not in emit_set:
+                continue
+            mp = float(max_ps[req_idx])
+            if mp <= 0.0 or mp > 1.001:
+                continue
+            self._lp_feature_seq_accumulator.register_request(req_id)
+            st = self._lp_feature_seq_accumulator._state[req_id]
+            st.chosen_lp.append(float(fs_cpu[req_idx, 0]))
+            st.max_p.append(mp)
+            st.neg_entropy.append(float(fs_cpu[req_idx, 2]))
+        # Build the cumulative snapshot (same shape as the eager path).
+        fs_state = self._lp_feature_seq_accumulator._state
+        feat_seq: dict = {}
+        for rid in emit_set:
+            fs = fs_state.get(rid)
+            if fs is None or not fs.chosen_lp:
+                continue
+            feat_seq[rid] = (
+                list(fs.chosen_lp),
+                list(fs.max_p),
+                list(fs.neg_entropy),
+            )
+        return feat_seq or None
+
     def _bookkeeping_sync(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3523,15 +3598,36 @@ class GPUModelRunner(
         # produced inline by the sampler, independent of
         # logprobs_tensors.
         fs_tensor = getattr(sampler_output, "feature_seq_tensor", None)
+        # SYS55 V2 (async-copy): the per-step blocking `.to("cpu")` of the
+        # feature rows was the dominant in-engine head overhead (~33% of
+        # worker wall, py-spy SYS55 STEP 2) — a hard sync that stalls the
+        # async-scheduling pipeline every decode step. In async mode we
+        # DEFER the D2H onto the existing async-output copy stream + event
+        # (one extra non-blocking copy, ZERO extra syncs) and run the CPU
+        # append + snapshot in AsyncGPUModelRunnerOutput.get_output(), after
+        # the single event.synchronize() that already gates the token copy.
+        # Bit-identical to the eager path (proven by the SYS55 quality gate).
+        self._pending_feature_seq = None
+        from vllm.distributed.parallel_state import get_tp_group as _get_tp
         if (
             fs_tensor is not None
             and self.input_batch.emit_per_token_feature_seq
             and sampled_token_ids.shape[-1] == 1
+            and _get_tp().rank_in_group == 0   # accumulation is rank-0 only
         ):
-            self._update_feature_seq_accumulator_step(
-                fs_tensor, num_sampled_tokens,
-                discard_sampled_tokens_req_indices,
-            )
+            if self.use_async_scheduling:
+                self._pending_feature_seq = (
+                    fs_tensor,
+                    list(self.input_batch.req_ids),
+                    set(discard_sampled_tokens_req_indices.tolist()),
+                    int(num_sampled_tokens),
+                    frozenset(self.input_batch.emit_per_token_feature_seq),
+                )
+            else:
+                self._update_feature_seq_accumulator_step(
+                    fs_tensor, num_sampled_tokens,
+                    discard_sampled_tokens_req_indices,
+                )
         logprobs_lists = None
         if not self.use_async_scheduling:
             # Get the valid generated tokens.
@@ -4487,8 +4583,15 @@ class GPUModelRunner(
             # pos_frac is computed at engine finalization since it
             # depends on the final T. List-of-list to keep the IPC
             # path msgspec-friendly.
+            # SYS55 V2 (async-copy): in async mode the accumulator has NOT
+            # been updated for this step yet (the D2H is deferred to the
+            # copy stream); the snapshot is built in get_output() after the
+            # event sync. Skip here. In sync mode, build it eagerly as before.
             feat_seq = None
-            if self.input_batch.emit_per_token_feature_seq:
+            if (
+                not self.use_async_scheduling
+                and self.input_batch.emit_per_token_feature_seq
+            ):
                 feat_seq = {}
                 # pylint: disable=protected-access
                 fs_state = self._lp_feature_seq_accumulator._state
@@ -4531,6 +4634,9 @@ class GPUModelRunner(
                 invalid_req_indices=invalid_req_indices,
                 async_output_copy_stream=self.async_output_copy_stream,
                 vocab_size=self.input_batch.vocab_size,
+                # SYS55 V2: defer the feature-seq D2H onto the copy stream.
+                pending_feature_seq=self._pending_feature_seq,
+                feature_finalize_fn=self._finalize_feature_seq_async,
             )
         with record_function_or_nullcontext(
             "gpu_model_runner: set_async_sampled_token_ids"
