@@ -564,11 +564,14 @@ class InEngineCascadeHead:
         if not feature_seq:
             return {"verdict": "REGEN", "score": None,
                     "tau": self.global_tau, "reason": "no_features"}
-        x = torch.tensor([feature_seq], dtype=torch.float32)
-        lens = torch.tensor([x.shape[1]])
-        with torch.inference_mode():
-            logit = self.model(x, lens)
-        score = float(torch.sigmoid(logit).item())
+        # SYS55 cell C: head-forward STUB. Skip the tensor construction +
+        # the 67k-param transformer matmul; return a constant score. The
+        # feature pipeline (GPU per-step sync + accumulation) and the gate
+        # plumbing (decide() call site, CompletionOutput.head_decision) are
+        # left fully intact, so (B - C) isolates the head-forward cost and
+        # (C - A) isolates the feature-pipeline cost. Decision-correctness
+        # is irrelevant for this throughput-only cell.
+        score = 0.5
         tau = self.tau_for(source)
         return {
             "verdict": "SHIP" if score >= tau else "REGEN",
