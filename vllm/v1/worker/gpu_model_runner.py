@@ -4496,11 +4496,19 @@ class GPUModelRunner(
                     fs = fs_state.get(rid)
                     if fs is None or not fs.chosen_lp:
                         continue
+                    # SYS55 V1 (delta-ship): ship only the rows appended since
+                    # the last snapshot, not the full growing list. The output
+                    # side appends; final list is bit-identical (quality gate).
+                    s = fs.n_shipped
+                    n = len(fs.chosen_lp)
+                    if n <= s:
+                        continue
                     feat_seq[rid] = (
-                        list(fs.chosen_lp),
-                        list(fs.max_p),
-                        list(fs.neg_entropy),
+                        fs.chosen_lp[s:],
+                        fs.max_p[s:],
+                        fs.neg_entropy[s:],
                     )
+                    fs.n_shipped = n
 
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,

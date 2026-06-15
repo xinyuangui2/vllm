@@ -772,9 +772,20 @@ class OutputProcessor:
             # running state. Lists of length = current T; finalized at
             # completion (tack on pos_frac, reshape to [T, 4]).
             if engine_core_output.per_token_feature_seq_running is not None:
-                req_state.per_token_feature_seq_running = (
-                    engine_core_output.per_token_feature_seq_running
-                )
+                # SYS55 V1 (delta-ship): the runner now ships per-step DELTAS
+                # (rows appended since the last snapshot), not the full
+                # cumulative list. Append them; the reconstructed list is
+                # bit-identical to the old cumulative-snapshot path.
+                delta = engine_core_output.per_token_feature_seq_running
+                cur = req_state.per_token_feature_seq_running
+                if cur is None:
+                    req_state.per_token_feature_seq_running = (
+                        list(delta[0]), list(delta[1]), list(delta[2]),
+                    )
+                else:
+                    cur[0].extend(delta[0])
+                    cur[1].extend(delta[1])
+                    cur[2].extend(delta[2])
 
             if pooling_output is None:
                 assert req_state.detokenizer is not None

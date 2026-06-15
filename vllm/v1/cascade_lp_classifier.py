@@ -149,6 +149,14 @@ class PerRequestFeatureSeq:
     chosen_lp: list[float] | None = None
     max_p: list[float] | None = None
     neg_entropy: list[float] | None = None
+    # SYS55 V1 (delta-ship): how many rows have already been shipped to the
+    # output side. The runner ships only rows[n_shipped:] each step instead
+    # of the full growing list, turning the per-step ModelRunnerOutput IPC
+    # from O(T) → O(1) (and the whole-request cost from O(T²) → O(T)). The
+    # output side appends the deltas; the final reconstructed list is
+    # bit-identical to the cumulative-snapshot path (proven by the SYS55
+    # quality gate).
+    n_shipped: int = 0
 
     def __post_init__(self) -> None:
         if self.chosen_lp is None:
